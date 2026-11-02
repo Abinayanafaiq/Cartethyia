@@ -483,15 +483,24 @@ function qoderEnvelopeToFrames(data: string): Array<{ event: string | null; data
   // raw newlines inside string values and parse again. The repaired text is
   // also what the direct-chunk branch hands to the chunk parser below, so its
   // own `JSON.parse` succeeds too.
+  //
+  // Live traffic shows those breaks are transport splits, not content: they
+  // land inside keys (`"choic\nes"`, `"fin\nish_reason"`), ids and numbers
+  // (`1793\n628743`). Valid JSON never carries a raw newline, so the first
+  // repair drops them, which restores the original bytes exactly. Escaping
+  // them instead kept a key like `choic\nes` unrecognised, so the chunk was
+  // silently skipped and its content (e.g. a tool-call argument fragment) was
+  // lost. Escaping stays as the last resort.
   let repaired = data;
   try {
     envelope = JSON.parse(data);
   } catch {
-    const attempted = escapeJsonRawNewlines(data);
-    if (attempted !== data) {
+    for (const attempted of [data.replace(/[\r\n]+/g, ""), escapeJsonRawNewlines(data)]) {
+      if (attempted === data) continue;
       try {
         envelope = JSON.parse(attempted);
         repaired = attempted;
+        break;
       } catch {
         envelope = undefined;
       }
@@ -1116,6 +1125,12 @@ export function buildQoderIdeRequest(
       },
     },
     max_tokens: (legacy.max_tokens as number) ?? 65_536,
+    // The tool declaration must travel on this surface too. Without it the
+    // model never sees the caller's tools and writes the call as plain text
+    // (raw JSON args, `<read>` tags, or DSML markup) instead of `tool_calls`.
+    tools: legacy.tools,
+    parallel_tool_calls: legacy.parallel_tool_calls,
+    ...(legacy.tool_choice === undefined ? {} : { tool_choice: legacy.tool_choice }),
   };
 }
 
