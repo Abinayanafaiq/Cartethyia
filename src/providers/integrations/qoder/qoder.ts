@@ -44,9 +44,18 @@ import {
   parseQoderTextToolCalls,
   isQoderEchoAttempt,
 } from "./qoder-text-tools";
+import {
+  dsmlPartialTail,
+  findDsmlStart,
+  isQoderDsmlAttempt,
+  parseQoderDsml,
+  type QoderDsmlTool,
+} from "./qoder-dsml";
 
 /** How long a trailing partial marker may be before it is held for the next frame. */
 const LEAK_HOLD_WINDOW = 24;
+/** Cap on a held DSML block; past it the turn fails closed instead of buffering forever. */
+const DSML_HOLD_MAX_CHARS = 4 * 1024 * 1024;
 /** Fail-open caps so an endless lookalike cannot hold text forever. */
 const LEAK_HOLD_MAX_CHARS = 32_768;
 const LEAK_HOLD_MAX_FRAMES = 200;
@@ -1185,6 +1194,7 @@ export async function* qoderBodyToCanonicalEvents(
   body: ReadableStream<Uint8Array>,
   signal: AbortSignal,
   model: string,
+  tools: readonly QoderDsmlTool[] = [],
 ): AsyncIterable<CanonicalEvent> {
   let seq = 1;
   yield { type: "response_start", sequence_number: seq++, model } as CanonicalEvent;
@@ -1201,6 +1211,12 @@ export async function* qoderBodyToCanonicalEvents(
   // (recovered) or ordinary prose (released).
   let leakBuf = "";
   let leakFrames = 0;
+  // DSML hold-back: DeepSeek on Qoder sometimes writes its tool call as DSML
+  // markup in the content stream. Everything from the first DSML tag on is
+  // held and converted to tool calls at end of stream. `dsmlTail` holds a
+  // possible partial tag (`<｜｜DS`) split across frames.
+  let dsmlBuf = "";
+  let dsmlTail = "";
 
   for await (const sse of decodeSseEvents(body, { signal })) {
     const sseData = sse.data;
@@ -1261,7 +1277,34 @@ export async function* qoderBodyToCanonicalEvents(
         const delta = choice["delta"] as Record<string, unknown> | undefined;
         if (delta) {
           if (typeof delta["content"] === "string" && (delta["content"] as string).length > 0) {
-            const piece = delta["content"] as string;
+            let piece = dsmlTail + (delta["content"] as string);
+            dsmlTail = "";
+            if (dsmlBuf.length > 0) {
+              dsmlBuf += piece;
+              if (dsmlBuf.length > DSML_HOLD_MAX_CHARS) throw badEchoError();
+              continue;
+            }
+            if (leakBuf.length === 0) {
+              const dsmlAt = findDsmlStart(piece);
+              if (dsmlAt >= 0) {
+                const emit = piece.slice(0, dsmlAt);
+                if (emit.length > 0) {
+                  yield {
+                    type: "content_delta",
+                    sequence_number: seq++,
+                    content: { kind: "text", text: emit },
+                  } as CanonicalEvent;
+                }
+                dsmlBuf = piece.slice(dsmlAt);
+                continue;
+              }
+              const partial = dsmlPartialTail(piece);
+              if (partial.length > 0) {
+                dsmlTail = partial;
+                piece = piece.slice(0, piece.length - partial.length);
+                if (piece.length === 0) continue;
+              }
+            }
             // Marker+JSON hold-back. A complete marker and everything after it is
             // held until end of stream; prose before it is emitted now.
             if (leakBuf.length > 0) {
@@ -1392,6 +1435,53 @@ export async function* qoderBodyToCanonicalEvents(
       // no stop signal, same as the per-delta field).
       if (json["finish_reason"] !== undefined && json["finish_reason"] !== "") finishReason = json["finish_reason"];
     }
+  }
+  // A partial DSML lookalike that never completed is ordinary text.
+  if (dsmlTail.length > 0) {
+    if (leakBuf.length > 0) leakBuf += dsmlTail;
+    else {
+      yield {
+        type: "content_delta",
+        sequence_number: seq++,
+        content: { kind: "text", text: dsmlTail },
+      } as CanonicalEvent;
+    }
+    dsmlTail = "";
+  }
+  // End of stream: recover a held-back DSML block. Recovered calls become
+  // tool calls; an unmistakable DSML call that cannot be recovered fails the
+  // turn (502, retryable) rather than leaking markup to the client.
+  if (dsmlBuf.length > 0) {
+    const recovered = parseQoderDsml(dsmlBuf, tools);
+    if (recovered !== null) {
+      const prose = `${recovered.before}${recovered.after}`.trim();
+      if (prose.length > 0) {
+        yield {
+          type: "content_delta",
+          sequence_number: seq++,
+          content: { kind: "text", text: prose },
+        } as CanonicalEvent;
+      }
+      for (const call of recovered.calls) {
+        yield {
+          type: "tool_call_delta",
+          sequence_number: seq++,
+          call_id: call.id,
+          name: call.name,
+          arguments_delta: call.arguments,
+        } as CanonicalEvent;
+      }
+      finishReason = "tool_calls";
+    } else if (isQoderDsmlAttempt(dsmlBuf)) {
+      throw badEchoError();
+    } else {
+      yield {
+        type: "content_delta",
+        sequence_number: seq++,
+        content: { kind: "text", text: dsmlBuf },
+      } as CanonicalEvent;
+    }
+    dsmlBuf = "";
   }
   // End of stream: recover a held-back marker+JSON echo. A valid echo becomes
   // tool calls; anything else is released as ordinary prose (or fails closed
@@ -1608,7 +1698,12 @@ class QoderAdapter implements ProviderAdapter {
       // context.abort_signal) governs the body. Keeping this timer armed
       // would kill healthy long streams at the stale pre-stream deadline.
       lifecycle.release();
-      yield* qoderBodyToCanonicalEvents(response.body as ReadableStream<Uint8Array>, lifecycle.signal, request.model);
+      yield* qoderBodyToCanonicalEvents(
+        response.body as ReadableStream<Uint8Array>,
+        lifecycle.signal,
+        request.model,
+        (request.tools ?? []).filter((tool) => tool.tool_type === undefined || tool.tool_type === "function"),
+      );
     } catch (err: unknown) {
       const abortError = abortGatewayError(lifecycle, err, context.abort_signal);
       if (abortError) throw abortError;
