@@ -116,6 +116,8 @@ export async function* decodeSseEvents(
   let eventName: string | null = null;
   let dataLines: string[] = [];
   let eventBytes = 0;
+  /** Head of a field name split off by a raw newline, glued to the next line. */
+  let carry = "";
 
   const onAbort = (): void => {
     reader.cancel(signal?.reason).catch(() => undefined);
@@ -177,7 +179,30 @@ export async function* decodeSseEvents(
     yield { event: name, data };
   }
 
-  function* emitLine(line: string): Iterable<SseEvent> {
+  function* emitLine(rawLine: string): Iterable<SseEvent> {
+    // A split can also land inside a field name (`da` / `ta: {...}`). The
+    // orphaned head is carried and glued to the next line instead of being
+    // read as a malformed line.
+    const line = carry + rawLine;
+    carry = "";
+    // An open `data:` payload that is not yet a complete JSON value owns the
+    // next non-blank, non-`data:` line as a continuation, whatever it starts
+    // with. Qoder's /model/v1 splits payloads with raw newlines at arbitrary
+    // byte offsets, including right before a `:` (`"model"` / `:"dfmodel"`).
+    // Read as an SSE comment, that line was dropped, the payload never
+    // closed, and every later frame was swallowed into one unparseable
+    // event — the visible symptom was output that stopped mid-answer.
+    if (
+      dataLines.length > 0 &&
+      line.trim() !== "" &&
+      !line.startsWith("data:") &&
+      !isCompleteJsonValue(dataLines.join("\n"))
+    ) {
+      dataLines.push(line);
+      eventBytes += line.length;
+      if (eventBytes > maxEventBytes) throw oversized("event");
+      return;
+    }
     if (line.startsWith(":")) return;
     if (line.startsWith("event:")) {
       const name = line.slice(6).trim();
@@ -221,6 +246,10 @@ export async function* decodeSseEvents(
       dataLines.push(line);
       eventBytes += line.length;
       if (eventBytes > maxEventBytes) throw oversized("event");
+      return;
+    }
+    if (line.length > 0 && ["data:", "event:"].some((field) => field.startsWith(line))) {
+      carry = line;
       return;
     }
     throw new GatewayError("platform_unavailable", 502, "Malformed SSE line (request {requestId}). The upstream sent something we can't read — retry 🌙", {}, "upstream");
