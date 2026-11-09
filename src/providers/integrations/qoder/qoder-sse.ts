@@ -67,6 +67,8 @@ export async function* decodeQoderSseEvents(
   let lineBuffer = "";
   let current: string | null = null; // accumulated payload of the open event
   let eventBytes = 0;
+  /** Head of a field name split off by a raw newline (`da` / `ta: {...}`). */
+  let carry = "";
 
   /** Returns the open payload when complete, else null (clearing it). */
   const takeComplete = (): string | null => {
@@ -113,9 +115,41 @@ export async function* decodeQoderSseEvents(
       for (;;) {
         const nl = lineBuffer.indexOf("\n");
         if (nl < 0) break;
-        const line = lineBuffer.slice(0, nl);
+        const line = carry + lineBuffer.slice(0, nl);
         lineBuffer = lineBuffer.slice(nl + 1);
+        carry = "";
         const trimmed = line.trim();
+
+        // An open payload that is not yet a complete JSON value owns the next
+        // non-blank, non-`data:` line as a continuation, whatever it starts
+        // with. Qoder splits payloads with raw newlines at arbitrary byte
+        // offsets, including right before a `:` (`"model"` / `:"dfmodel"`);
+        // read as a comment or a field, that fragment was dropped and the
+        // payload never closed, swallowing every later frame.
+        if (
+          current !== null &&
+          trimmed.length > 0 &&
+          !trimmed.startsWith("data:") &&
+          current.trim() !== "[DONE]" &&
+          !isCompleteJsonValue(current.trim())
+        ) {
+          appendPayload("\n" + line);
+          if (yield* emitComplete()) return;
+          continue;
+        }
+
+        // A split can also land inside a field name (`da` / `ta: {...}`,
+        // `data` / `: {...}`). The orphaned head is carried and glued to the
+        // next line instead of being dropped as a bare fragment.
+        if (
+          trimmed.length > 0 &&
+          trimmed === line &&
+          ["data:", "event:"].some((field) => field !== trimmed && field.startsWith(trimmed))
+        ) {
+          if (yield* emitComplete()) return;
+          carry = line;
+          continue;
+        }
 
         // Comments, event names, and other fields carry no payload.
         if (trimmed.startsWith(":") || trimmed.startsWith("event:")) continue;
