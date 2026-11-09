@@ -568,8 +568,16 @@ export function isContextLengthFailure(body: unknown): boolean {
  * not agree on one, and a queue with no duration still has to be reported as a
  * queue — the caller's wait is then bounded by the caller, not by us.
  */
-export function queueRetryAfterMs(body: unknown): number | undefined {
+export function queueRetryAfterMs(body: unknown, depth = 0): number | undefined {
   if (!isRecord(body)) return undefined;
+  // Same nesting as `isUpstreamQueued`: Qoder carries the queue verdict (and its
+  // `retryAfterSeconds`) as JSON text inside `message`.
+  if (depth < 3) {
+    for (const candidate of [body.message, body.msg]) {
+      const nested = queueRetryAfterMs(parseNestedJsonRecord(candidate), depth + 1);
+      if (nested !== undefined) return nested;
+    }
+  }
   const envelope = isRecord(body.error) ? body.error : body;
   for (const source of [envelope, body]) {
     for (const key of ["retryAfterSeconds", "retry_after_seconds", "retryAfterMs", "retry_after"]) {
@@ -603,8 +611,17 @@ export function queueRetryAfterMs(body: unknown): number | undefined {
  * long body is not enough on its own, which is why the message test requires
  * the queue to be what the message is *about* rather than a word it contains.
  */
-export function isUpstreamQueued(body: unknown): boolean {
+export function isUpstreamQueued(body: unknown, depth = 0): boolean {
   if (!isRecord(body)) return false;
+  // Qoder's COSY gateway nests the real verdict as JSON text inside `message`,
+  // up to three levels deep: `{"code":"403","message":"{\"code\":\"10605\",
+  // \"message\":\"{\\\"isQueued\\\":true,…}\"}"}`. Read through those layers.
+  if (depth < 3) {
+    for (const candidate of [body.message, body.msg]) {
+      const nested = parseNestedJsonRecord(candidate);
+      if (nested !== undefined && isUpstreamQueued(nested, depth + 1)) return true;
+    }
+  }
   const envelope = isRecord(body.error) ? body.error : body;
   if (envelope.isQueued === true || body.isQueued === true) return true;
   if (envelope.queued === true || body.queued === true) return true;
@@ -618,6 +635,19 @@ export function isUpstreamQueued(body: unknown): boolean {
     if (/\bqueued\b|\bis queue\b|resource_limit/.test(lower)) return true;
   }
   return false;
+}
+
+/** A JSON object carried as text (`"{...}"`), or undefined. */
+function parseNestedJsonRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{")) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The error a queued upstream request becomes: retryable, with its wait. */

@@ -79,7 +79,7 @@ async function collect(
 }
 
 describe("Qoder dispatch surface", () => {
-  test("default surface is the modern `/model/v1` (ide), not legacy", async () => {
+  test("default surface is legacy COSY — the modern host api2-v2 is dead (NXDOMAIN since 2026-11-07)", async () => {
     const urls: string[] = [];
     let calls = 0;
     const fetcher = (async (input: unknown, _init?: RequestInit): Promise<Response> => {
@@ -90,7 +90,8 @@ describe("Qoder dispatch surface", () => {
     const adapter = createQoderAdapter();
     await collect(adapter, fetcher);
     expect(calls).toBe(1);
-    expect(urls[0]).toContain("/model/v1/chat/completions");
+    expect(urls[0]).toContain("/algo/api/v2/service/pro/sse/agent_chat_generation");
+    expect(urls[0]).not.toContain("api2-v2");
   });
 
   test("falls back to legacy COSY for a free-tier model when modern answers 402/116", async () => {
@@ -107,7 +108,7 @@ describe("Qoder dispatch surface", () => {
       }
       return streamOk();
     }) as typeof fetch;
-    const adapter = createQoderAdapter();
+    const adapter = createQoderAdapter({ surface: "ide" });
     await collect(adapter, fetcher);
     expect(calls).toBe(2);
     expect(urls[0]).toContain("/model/v1/chat/completions");
@@ -125,7 +126,7 @@ describe("Qoder dispatch surface", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const adapter = createQoderAdapter();
+    const adapter = createQoderAdapter({ surface: "ide" });
     // `smodel` is a billed row (`is_free: false`): 116 is real quota
     // exhaustion, so no legacy fallback — the modern error surfaces.
     await expect(collect(adapter, fetcher, "smodel")).rejects.toThrow();
@@ -144,7 +145,7 @@ describe("Qoder dispatch surface", () => {
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
-    const adapter = createQoderAdapter();
+    const adapter = createQoderAdapter({ surface: "ide" });
     await expect(collect(adapter, fetcher)).rejects.toThrow();
     expect(calls).toBe(1);
     expect(urls[0]).toContain("/model/v1/chat/completions");

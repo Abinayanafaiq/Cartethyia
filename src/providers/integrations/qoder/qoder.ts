@@ -504,9 +504,14 @@ export function qoderEnvelopeToFrames(data: string): Array<{ event: string | nul
     // on HTTP: `{"code":"10605", "isQueued":true, "retryAfterSeconds":N}` on a
     // non-200 envelope. The status table would read the 403 as a refusal, and
     // the caller would end its turn on a request that was only waiting.
-    const queuedWaitMs = isUpstreamQueued(rec["body"]) ?? false;
+    // The envelope `body` can be the verdict as JSON *text* (COSY nests it, e.g.
+    // `{"code":"403","message":"{\"code\":\"10605\",…isQueued…}"}`); wrapping
+    // it as a message lets the queue reader parse through the layers.
+    const queueBody =
+      typeof rec["body"] === "string" ? { message: rec["body"] } : rec["body"];
+    const queuedWaitMs = isUpstreamQueued(queueBody) ?? false;
     const waitMs = queuedWaitMs
-      ? (queueRetryAfterMs(rec["body"]) ?? undefined)
+      ? (queueRetryAfterMs(queueBody) ?? undefined)
       : undefined;
     const classification = queuedWaitMs
       ? { code: "upstream_queued" as const, status: 503, origin: "upstream" as const }
@@ -1752,7 +1757,11 @@ class QoderAdapter implements ProviderAdapter {
   constructor(options: QoderAdapterOptions = {}) {
     this.provider_id = (options.providerId ?? QODER_PROVIDER_ID) as ProviderId;
     this.realm = options.realm ?? "intl";
-    this.surface = options.surface ?? "ide";
+    // `cosy` by default: the modern surface's host (`api2-v2.qoder.sh`) is
+    // NXDOMAIN since 2026-11-07 and no surviving host serves `/model/v1` or
+    // gRPC, so the legacy COSY gateway (`api1`/`api2`/`api3`) is the only live
+    // chat path. `ide` stays available as an explicit override.
+    this.surface = options.surface ?? "cosy";
     this.fetchFn = options.fetch ?? globalThis.fetch;
   }
 
