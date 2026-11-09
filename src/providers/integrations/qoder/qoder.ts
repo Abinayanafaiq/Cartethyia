@@ -52,6 +52,12 @@ import {
   type QoderDsmlTool,
 } from "./qoder-dsml";
 
+/** The bare roster key of a model id (`qoder/dfmodel` → `dfmodel`). */
+function qoderModelKeyOf(model: string): string {
+  const trimmed = model.trim();
+  return trimmed.slice(trimmed.lastIndexOf("/") + 1);
+}
+
 /** How long a trailing partial marker may be before it is held for the next frame. */
 const LEAK_HOLD_WINDOW = 24;
 /** Cap on a held DSML block; past it the turn fails closed instead of buffering forever. */
@@ -1398,15 +1404,20 @@ export async function* qoderBodyToCanonicalEvents(
       } catch {
         continue;
       }
-      // The upstream names the real model in each chunk. Use the first one we
-      // see for the opening event so the client sees the same model the
-      // provider actually served, not the (virtual) id that was requested.
+      // The upstream names a model in each chunk; the first one opens the
+      // response. The IDE surface echoed the roster key (`dfmodel`), but the
+      // legacy COSY surface — the only live one since 2026-11-07 — echoes a
+      // fixed "auto" whatever `model_config.key` asked for. That echo carries
+      // no information about the serving model, so it never replaces a
+      // specific requested key: the client sees the model it asked for.
       if (!started && typeof json["model"] === "string") {
         const upstreamModel = (json["model"] as string).trim();
+        const opaqueEcho =
+          upstreamModel === "auto" && model.trim() !== "" && qoderModelKeyOf(model) !== "auto";
         yield {
           type: "response_start",
           sequence_number: seq++,
-          model: upstreamModel.length > 0 ? upstreamModel : model,
+          model: upstreamModel.length > 0 && !opaqueEcho ? upstreamModel : model,
         } as CanonicalEvent;
         started = true;
       }
@@ -1877,7 +1888,10 @@ class QoderAdapter implements ProviderAdapter {
       yield* qoderBodyToCanonicalEvents(
         response.body as ReadableStream<Uint8Array>,
         lifecycle.signal,
-        request.model,
+        // The caller-facing id that was dispatched (a virtual name or roster
+        // key), not `request.model`, which can be a combo/alias name. It is
+        // what the response reports when COSY only echoes an opaque "auto".
+        requestedModelId,
         (request.tools ?? []).filter((tool) => tool.tool_type === undefined || tool.tool_type === "function"),
       );
     } catch (err: unknown) {
