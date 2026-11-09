@@ -696,6 +696,25 @@ const AUTH_ERROR_IDENTIFIERS: ReadonlySet<string> = new Set([
   "insufficient_key_scope",
   "model_not_allowed_for_key",
 ]);
+
+/**
+ * Qoder job-token verdicts that are NOT credential evidence.
+ *
+ * A PAT (`pt-…`) is exchanged for a short-lived job token (`jt-…`). When the
+ * job token expires mid-flight the upstream answers `{"code":"105","message":
+ * "Login expired"}` (403). The PAT is still valid — re-exchanging it mints a
+ * fresh job token — so treating this as `auth_invalidated` parked a healthy
+ * account as "Re-login required". It stays `authentication_failed` (retryable;
+ * the next attempt re-runs the PAT exchange) but without `credentialEvidence`,
+ * so the account is never disabled or cooled on it.
+ */
+const QODER_JOB_TOKEN_EXPIRED: ReadonlySet<string> = new Set([
+  "105",
+  "login expired",
+  "login_expired",
+  "job token expired",
+  "jobtoken expired",
+]);
 const PLATFORM_ERROR_IDENTIFIERS: ReadonlySet<string> = new Set([
   "server_error",
   "internal_error",
@@ -809,6 +828,16 @@ export function classifyUpstreamError(
       origin: "upstream",
       rateLimitScope: "provider",
     };
+  // Qoder job-token expiry (`105` / "Login expired") is recoverable by
+  // re-exchanging the PAT — never credential evidence (see
+  // `QODER_JOB_TOKEN_EXPIRED`).
+  if (normalized !== undefined && QODER_JOB_TOKEN_EXPIRED.has(normalized)) {
+    return {
+      code: "authentication_failed",
+      status: status === 403 || status === 401 ? status : 403,
+      origin: "upstream",
+    };
+  }
   if (normalized !== undefined && AUTH_ERROR_IDENTIFIERS.has(normalized)) {
     let authStatus: number;
     if (status === 401 || status === 403) authStatus = status;
@@ -920,7 +949,21 @@ export async function mapUpstreamHttpError(response: Response, providerId: strin
       ? { code: "context_length_exceeded" as const, status: 413, origin: "upstream" as const }
       : classifyUpstreamError(response.status, identifier);
   const extracted = extractUpstreamMessage(parsedBody ?? text);
-  const message = (extracted.length > 0 ? extracted : text.trim() || `Provider returned HTTP ${response.status}.`).slice(0, MAX_UPSTREAM_ERROR_BYTES).replace(/[\r\n]+/g, " ");
+  let message =
+    extracted.length > 0
+      ? extracted
+      : text.trim() || `Provider returned HTTP ${response.status}.`;
+  // A bare "Provider returned HTTP <5xx>" tells the operator nothing actionable;
+  // platform-unavailable fallbacks get the same human sign-off every other
+  // gateway error carries. The raw upstream body stays in `details.raw` for
+  // diagnostics either way.
+  if (
+    classification.code === "platform_unavailable" &&
+    message === `Provider returned HTTP ${response.status}.`
+  ) {
+    message = `The provider's service is temporarily unavailable (HTTP ${response.status}) (request {requestId}). Your request did not go through — wait a moment and try again. Hold tight ☁️`;
+  }
+  message = message.slice(0, MAX_UPSTREAM_ERROR_BYTES).replace(/[\r\n]+/g, " ");
   const headerWaitMs = parseUpstreamBackoff(response.headers);
   // A queue carries its own interval, which is the one the caller must honour:
   // it is what the upstream promised, while `Retry-After` may be absent or may

@@ -28,6 +28,7 @@ import { DrizzleProviderCatalogStore } from "../console/providers/catalog/store"
 import { InMemoryRouteSnapshotService } from "../transport/routing/route-model";
 import { RoutingEngine } from "../transport/routing/router";
 import { RedisAdmissionController } from "../transport/routing/admission";
+import { admissionKey } from "../transport/routing/admission";
 import { ApiKeyAdmissionService } from "../security/admission/service";
 import { InMemoryAdmissionCounterStore } from "../security/admission/in-memory-store";
 import { RedisAdmissionCounterStore } from "../security/admission/redis-store";
@@ -38,7 +39,7 @@ import { setPendingUsageSource } from "../security/api-key-auth";
 import { HealthEventFlushBuffer, setHealthEventBuffer } from "../persistence/health-event-flush";
 import { subscribePeerSettingsRevisions } from "../persistence/settings-revision";
 import { deleteExpiredSessions } from "../console/auth/session-service";
-import { InMemoryIpAbuseStore, IpAbuseProtectionService, RedisIpAbuseStore } from "../security/abuse";
+import { InMemoryIpAbuseStore, IpAbuseProtectionService, RedisIpAbuseStore, type IpAbuseStore } from "../security/abuse";
 import { checkReadiness } from "../persistence/readiness";
 import { ProxyRequestPreparer } from "../transport/request/preparer";
 import { DrizzleNetworkPoolLoader } from "../network/pool/loader";
@@ -50,6 +51,7 @@ import { NetworkPoolSelector } from "../network/pool/selector";
 import { restorePoolProbeVerdicts, restoreProviderCooldownMarkers } from "../network/pool-cooldown-store";
 import { ScheduledTaskRegistry } from "../workers/scheduler";
 import { quotaRefreshSweep } from "../workers/quota-refresh-sweep";
+import { registerZcodeGiftClaimTask } from "../workers/zcode-gift-claim";
 import { markProviderApiKeyCredential } from "../console/quota/account-quota-shared";
 import { dailyCheckinEgressForPass } from "../workers/daily-checkin";
 import {
@@ -102,6 +104,8 @@ export interface ProductionDeps {
   proxyPreparer: ProxyRequestPreparer;
   networkBindingFactory: ValidatedNetworkBindingFactory;
   ipAbuseProtection: IpAbuseProtectionService;
+  /** The abuse store backing manual IP bans and the ban list. */
+  ipAbuseStore: IpAbuseStore;
   readiness: () => Promise<ReadinessCheckResult>;
   scheduledTasks: ScheduledTaskRegistry;
   poolAgentResolver: PoolAgentResolver;
@@ -478,10 +482,17 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
         owned.has(candidate.provider_account_id),
     );
     const snapshot = await routingEngine.accountInflightSnapshot(ownedCandidates);
+    // Map each bucket back to the account it belongs to using the same
+    // `admissionKey` format admission writes with — never string-slicing the
+    // bucket (the trailing segment is the owner tenant, not the account id).
+    const accountByBucket = new Map<string, string>();
+    for (const candidate of ownedCandidates) {
+      accountByBucket.set(admissionKey(candidate), candidate.provider_account_id!);
+    }
     const totals = new Map<string, number>();
     for (const [bucket, count] of snapshot) {
-      const accountId = bucket.slice(bucket.lastIndexOf(":") + 1);
-      if (!owned.has(accountId)) continue;
+      const accountId = accountByBucket.get(bucket);
+      if (accountId === undefined || !owned.has(accountId)) continue;
       totals.set(accountId, (totals.get(accountId) ?? 0) + count);
     }
     return [...totals].map(([accountId, inflight]) => ({ accountId, inflight }));
@@ -584,6 +595,11 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     name: "client-version-monitor",
     intervalMs: CLIENT_VERSION_MONITOR_INTERVAL_MS,
     initialDelayMs: CLIENT_VERSION_INITIAL_DELAY_MS,
+    // Pure outbound reads with no shared rows/files: they must not be gated
+    // by the process-wide busy latch, or a nearly-continuous heavy sweep
+    // (quota-refresh) starves this monitor at its single initial tick and
+    // every 30-minute interval after it.
+    skipGate: true,
     run: refreshProviderClientVersions,
   });
 
@@ -644,6 +660,13 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
         // itself at `info` level, so they survive the production LOG_LEVEL.
         // `onTick` is left for tests.
       }),
+  });
+  registerZcodeGiftClaimTask(scheduledTasks, {
+    db,
+    redis,
+    resolveCredential: quotaResolveCredential,
+    snapshotInvalidator: snapshotService,
+    fetcherFor: dailyCheckinEgressForPass({ db, networkBindingFactory }),
   });
   // The buddy growth/credit tasks: one per upstream capability, each
   // independently switchable with `CARTETHYIA_DISABLED_TASKS`. Every one of
@@ -723,6 +746,7 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
     }),
     networkBindingFactory,
     ipAbuseProtection,
+    ipAbuseStore: ipStore,
     readiness,
     scheduledTasks,
     poolAgentResolver,

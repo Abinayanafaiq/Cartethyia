@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { qoderBodyToCanonicalEvents } from "../../../src/providers/integrations/qoder/qoder";
-import { dsmlPartialTail, parseQoderDsml } from "../../../src/providers/integrations/qoder/qoder-dsml";
+import { dsmlPartialTail, parseQoderDsml, recoverQoderDsmlEvents } from "../../../src/providers/integrations/qoder/qoder-dsml";
 
 /**
  * DeepSeek on Qoder sometimes writes its tool call as DSML markup in the
@@ -51,7 +51,7 @@ function body(chunks: readonly string[]): ReadableStream<Uint8Array> {
 
 async function collect(chunks: readonly string[], tools = TOOLS): Promise<Array<Record<string, unknown>>> {
   const out: Array<Record<string, unknown>> = [];
-  for await (const e of qoderBodyToCanonicalEvents(body(chunks), new AbortController().signal, "m", tools)) {
+  for await (const e of recoverQoderDsmlEvents(qoderBodyToCanonicalEvents(body(chunks), new AbortController().signal, "m"), tools)) {
     out.push(e as unknown as Record<string, unknown>);
   }
   return out;

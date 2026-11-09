@@ -1,12 +1,15 @@
 # Cartethyia
 
-<img width="1760" height="576" alt="Cartethyia banner" src="https://github.com/user-attachments/assets/666f3a3d-136e-49d7-8bec-ff967f93b78f" />
+<img width="1760" height="576" alt="og_image" src="dashboard/public/assets/brand/og_image.jpg" />
 
 **A self-hosted multi-provider AI gateway.**
 
+[![License: GPL-3.0-only](https://img.shields.io/badge/License-GPL--3.0--only-blue.svg)](LICENSE)
+[![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
+
 Cartethyia gives AI clients one stable, OpenAI and Anthropic-compatible endpoint. Behind it, the gateway handles the operational work: provider-aware translation, account selection, health-aware failover, quota and cooldown enforcement, usage accounting, telemetry, and optional proxy pools.
 
-Configure provider accounts once, issue an API key, and point OpenCode, Droid, Cline, Claude Code, Codex, or any compatible client at Cartethyia. The client keeps its native protocol; Cartethyia normalizes the request, selects a viable route, dispatches upstream, and returns the response in the contract the client expects.
+Configure provider accounts once, issue an API key, and point OpenCode, Kilo, Droid, Cline, Claude Code, Codex, ZCode, or any compatible client at Cartethyia. The client keeps its native protocol; Cartethyia normalizes the request, selects a viable route, dispatches upstream, and returns the response in the contract the client expects.
 
 Built with Bun, TypeScript, Elysia, embedded SQLite or external PostgreSQL, and optional Redis coordination.
 
@@ -47,9 +50,26 @@ will not be found. Either install globally, or run a local one through
 Update and remove:
 
 ```bash
-npm update -g cartethyia    # update
+npm update -g cartethyia    # update the npm package itself
+cartethyia update           # update the running install (binary/config refresh)
 npm uninstall -g cartethyia # uninstall
 ```
+
+### Everyday commands
+
+| Command | What it does |
+| --- | --- |
+| `carte` | Start the gateway in the background, then show a terminal menu (console, reset password, backup, update, exit) — works over SSH / headless |
+| `carte --tray` | Start with a system-tray icon instead (needs a graphical session) |
+| `cartethyia menu` | Re-attach the arrow-key menu to a running gateway |
+| `cartethyia start` | Start the gateway without a menu |
+| `cartethyia stop` | Stop the detached gateway (also `./carte stop` after an install) |
+| `cartethyia doctor` | Check the install: config, database mode, ports, binary health |
+| `cartethyia update` | Update the running install (release refresh) — distinct from `npm update -g` |
+| `cartethyia setup [--non-interactive]` | Re-run setup (Lite vs Full, config paths) non-interactively |
+| `cartethyia admin reset-lockout <username> <clientIp>` | Unlock a locked console account |
+| `cartethyia admin reset-lockout --all` | Unlock every locked console account |
+| `cartethyia telemetry reconcile --apply` / `--verify` | Reconcile telemetry state |
 
 Full install guide, modes, Docker, VPS, systemd, and the one-shot script:
 [the installation guide](documentation/installation.md). To remove it:
@@ -161,11 +181,18 @@ From the repository root:
 bun install
 bun run dev              # backend with hot reload
 bun run typecheck         # backend typecheck
+bun run test              # full suite (backend + dashboard)
 bun run test:backend      # backend suites (Lite + Full modes)
+bun run test -- --scope dashboard   # dashboard suites only
+bun run test -- --test-name-pattern admission   # filter by name
 bun run dashboard:typecheck
 bun run dashboard:test
 bun run dashboard:dev     # dashboard dev server
 ```
+
+The default test scope runs in parallel with at most `min(CPU cores, 4)`
+workers so the suite does not pin every core; set `CARTETHYIA_TEST_JOBS` to
+override (e.g. `CARTETHYIA_TEST_JOBS=2 bun run test`).
 
 Backend suites live in `test/`, mirroring `src/`; dashboard suites live in
 `dashboard/test/`. `bun run test:backend` runs the default backend scope and
@@ -180,3 +207,9 @@ suite never touches the runtime `DATABASE_URL`.
 
 [GNU GPL v3.0 only](LICENSE). You can use, change, and share it. If you ship a
 build or a fork, ship the source with it, under the same license. No warranty.
+
+## <img src="https://api.iconify.design/lucide/heart.svg?color=%238b949e" width="20" height="20" alt=""> Community
+
+- [Contributing](CONTRIBUTING.md) — workflow, code conventions, and pull requests.
+- [Code of Conduct](CODE_OF_CONDUCT.md) — expectations for everyone in the community.
+- [Security Policy](SECURITY.md) — how to report a vulnerability safely.

@@ -1080,6 +1080,7 @@ describe("decodeChatSseStream — usage merging", () => {
   });
 
   test("a usage frame carrying cached tokens keeps them", async () => {
+    // The provider-reported cache split is preserved as-is.
     const events = await collect(
       sseStream(
         frame({

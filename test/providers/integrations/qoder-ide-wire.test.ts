@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { buildQoderIdeRequest, qoderBodyToCanonicalEvents } from "../../../src/providers/integrations/qoder/qoder";
 import type { CanonicalRequest } from "../../../src/protocol/canonical-model";
+import { recoverQoderDsmlEvents } from "../../../src/providers/integrations/qoder/qoder-dsml";
 
 /**
  * Two wire defects on the modern `/model/v1` surface, both found live
@@ -24,7 +25,7 @@ test("ide request carries the declared tools and tool_choice", () => {
   const request = {
     model: "dmodel",
     messages: [{ role: "user", content: [{ kind: "text", text: "read a.txt" }] }],
-    generation_controls: {},
+    generation_controls: { parallel_tool_calls: true },
     stream: true,
     source_surface: "chat",
     tools: [READ_TOOL],
@@ -36,11 +37,14 @@ test("ide request carries the declared tools and tool_choice", () => {
   const tools = body["tools"] as Array<{ type: string; function: { name: string } }>;
   expect(Array.isArray(tools)).toBe(true);
   expect(tools.map((t) => t.function.name)).toEqual(["read"]);
-  expect(body["parallel_tool_calls"]).toBe(true);
-  expect(body["tool_choice"]).toBe("required");
+  // The remaining knobs ride the `parameters` passthrough, as the desktop
+  // client sends them.
+  const parameters = body["parameters"] as Record<string, unknown> | undefined;
+  expect(parameters?.["parallel_tool_calls"]).toBe(true);
+  expect(parameters?.["tool_choice"]).toBe("required");
 });
 
-test("ide request sends an empty tools array when none are declared", () => {
+test("ide request omits tools when none are declared", () => {
   const request = {
     model: "dmodel",
     messages: [{ role: "user", content: [{ kind: "text", text: "hi" }] }],
@@ -51,7 +55,9 @@ test("ide request sends an empty tools array when none are declared", () => {
   const auth = { userId: "u", userName: "", userType: "personal_standard", securityOauthToken: "jt-x", refreshToken: "" };
   const cfg = { id: "dmodel", display_name: "DeepSeek", max_input_tokens: 180000, is_vl: true, is_reasoning: true };
   const body = buildQoderIdeRequest("dmodel", request, cfg as never, auth as never);
-  expect(body["tools"]).toEqual([]);
+  // No declared tools: the body carries no `tools` key at all, as the
+  // desktop client omits it.
+  expect(body["tools"]).toBeUndefined();
 });
 
 function chunk(delta: Record<string, unknown>, finish: string | null = null): string {
@@ -67,7 +73,7 @@ async function collect(sse: string): Promise<Array<Record<string, unknown>>> {
   const enc = new TextEncoder();
   const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(enc.encode(sse)); c.close(); } });
   const out: Array<Record<string, unknown>> = [];
-  for await (const e of qoderBodyToCanonicalEvents(body, new AbortController().signal, "dmodel", [READ_TOOL])) {
+  for await (const e of recoverQoderDsmlEvents(qoderBodyToCanonicalEvents(body, new AbortController().signal, "dmodel"), [READ_TOOL])) {
     out.push(e as unknown as Record<string, unknown>);
   }
   return out;

@@ -88,7 +88,7 @@ Variables read outside the spec are therefore **not** listed below:
 
 | Variable | Kind | Default | Bounds |
 | --- | --- | --- | --- |
-| `IP_RATE_MAX_PER_WINDOW` | integer | 240 | 1 – 9007199254740991 |
+| `IP_RATE_MAX_PER_WINDOW` | integer | 540 | 1 – 9007199254740991 |
 | `CARTETHYIA_ENCRYPTION_KEY` | string, required | — (unset throws at startup) | — |
 | `CARTETHYIA_PUBLIC_ORIGIN` | string, required | — (unset throws at startup) | — |
 
@@ -99,6 +99,7 @@ Variables read outside the spec are therefore **not** listed below:
 | `CARTETHYIA_KIMI_OAUTH_HOST` | string | `https://auth.kimi.com` | — |
 | `CARTETHYIA_KIMI_QUOTA_BASE_URL` | string | `https://api.kimi.com/coding/v1` | — |
 | `CARTETHYIA_GITHUB_ENTERPRISE_DOMAIN` | string | `` | — |
+| `CARTETHYIA_GITHUB_COPILOT_MODE` | string | `opencode-copilot` | — |
 
 ## Other
 
@@ -106,7 +107,7 @@ Variables read outside the spec are therefore **not** listed below:
 | --- | --- | --- | --- |
 | `DASHBOARD_DIST` | string | `./dist/dashboard` | — |
 | `CARTETHYIA_API_KEY` | string, optional | unset | — |
-| `CARTETHYIA_SERVER_MAX_BODY_BYTES` | integer | 4194304 | 1024 – 9007199254740991 |
+| `CARTETHYIA_SERVER_MAX_BODY_BYTES` | integer | 16777216 | 1024 – 9007199254740991 |
 | `CARTETHYIA_SERVER_IDLE_TIMEOUT` | integer | 60 | 0 – 86400 |
 | `CARTETHYIA_CONCURRENCY_TOLERANCE` | integer, optional | unset | 0 – 1024 when set |
 | `CARTETHYIA_PROCESS_COUNT` | integer | 1 | 1 – 16 |
@@ -115,6 +116,9 @@ Variables read outside the spec are therefore **not** listed below:
 | `CARTETHYIA_FORCED_GC` | flag | enabled (disabled only when literally `false`) | — |
 | `CARTETHYIA_RUNTIME_METRICS_INTERVAL_MS` | integer | 30000 | 1000 – 300000 |
 | `CARTETHYIA_DISABLED_TASKS` | comma-separated list | unset | — |
+| `CARTETHYIA_QODER_UMID_MINI` | integer | 0 | 0 – 1 |
+| `CARTETHYIA_USAGE_INPUT_MODE` | string | `inclusive` | — |
 | `CARTETHYIA_POOL_PROVIDER_RATE_LIMIT_COOLDOWN_MS` | integer | 3600000 | 0 – 86400000 |
 | `CARTETHYIA_OAUTH_CALLBACK_PORT` | integer | 59653 | 1024 – 65535 |
+| `CARTETHYIA_ZCODE_AUTO_CLAIM` | string | `false` | — |
 | `CARTETHYIA_OPENCODE_UNAVAILABLE_FREE` | comma-separated list | unset | — |

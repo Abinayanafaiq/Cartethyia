@@ -170,7 +170,7 @@ Verified in code only. `bespokeWire` = the adapter frames its own protocol, not 
 | gemini | `x-goog-api-key` header, per-model `:generateContent`/`:streamGenerateContent` paths; not OpenAI-shaped. Image generation uses the same path. |
 | xai / grok | Same issuer and JWKS, different surfaces: `grok` is the free Grok Build CLI proxy, `xai` is the paid API (`provider-metadata.ts`, `grok`/`xai` rows). |
 | kilo | Resells the OpenRouter catalog behind a `{accessToken, orgId}` JSON credential. No refresh grant. |
-| qoder | Device flow whose refresh endpoint answers 403; no refresher. Two realms (`qoder`, `qodercn`) with separate gateways, OAuth clients, and rosters. Upstream keys are opaque slots (`dfmodel`, `cmodel`), so the catalog publishes caller-facing names instead (`deepseek-v4.1-flash`, `cantus`); dispatch translates them back — see `integrations/qoder/qoder-virtual.ts`. `/model/list` states no output limit, so ceilings come per row. Free tier is read from upstream's own `is_free`, not hardcoded. |
+| qoder | Device flow whose refresh endpoint answers 403; no refresher. Two realms (`qoder`, `qodercn`) with separate gateways, OAuth clients, and rosters. Upstream keys are opaque slots (`dfmodel`, `cmodel`), so the catalog publishes caller-facing names instead (`deepseek-v4.1-flash`, `cantus`); dispatch translates them back — see `integrations/qoder/qoder-virtual.ts`. `/model/list` states no output limit, so ceilings come per row. Free tier is read from upstream's own `is_free`, not hardcoded. Transport split: free `lite` slots use the legacy COSY surface; billed slots use gRPC (`ChatCompletionStream`, the only surface that carries 1M-token context). The gRPC wire is protobuf — request `tools`/`tool_choice`/`parallel_tool_calls` and response `delta.tool_calls` use Struct/Value wrapper shapes, not OpenAI JSON (see `documentation/research/qoder/live/2026-11-05-qoder-tool-calling.md` and `documentation/research/qoder/live/2026-11-05-qoder-model-matrix.md`). |
 | trae / traecn | Two disjoint surfaces that share no model id: chat (`/api/ide/v1/llm_raw_chat`, keyed by `model_name`) and agent (`/api/agent/v3/llm_utils_chat`, keyed by `config_name` + `config_source` + `function: solo_agent`). The intl catalog is agent-only, because neither surface serves the other's ids. Current behavior is owned by the Trae provider implementation and its tests. |
 | cline | Discovery reads only `recommended` + `free` — the pass roster would write subscription rows an operator's account can only 401 on. |
 | openrouter / zcode | PKCE ends by minting a **durable API key**, not an access token; no refresher. |
@@ -186,6 +186,78 @@ Verified in code only. `bespokeWire` = the adapter frames its own protocol, not 
 | dashscope | Alibaba's mainland DashScope coding host, plain bearer on `https://coding.dashscope.aliyuncs.com/v1`. Distinct from `alibabacp` (Token Plan on `token-plan.*.maas.aliyuncs.com`). Live `/v1/models` discovery plus an 8-row static floor. |
 | factory / cloudflareai / alibabacp catalogs | Static rosters in `integrations/*/*-models.ts`; none publishes a listable endpoint, so the catalog is the list. Limits come from the base catalog via `models-dev-catalog.ts` remaps; capability is declared per row. |
 | cursor | Bespoke (`provider-metadata.ts`). Connect-RPC over protobuf on a bidirectional HTTP/2 stream, so it uses the validated `outbound_http2` capability rather than `fetch`. The Run origin comes from `GetServerConfig` per dispatch, not from the metadata base URL (which serves auth and catalog only). Its tool loop spans two client requests on one upstream Run, so the Run and its account/pool slot outlive the request that opened them — see [Cursor provider](../features/08-cursor-provider.md). No quota collector: no endpoint is established. The `x-cursor-client-version` identity is `cli-<version>-<sha7>` and is **discovered** from the official download API (`VERSION_SOURCES.cursor`), which is the only source returning both halves; the constant in `cursor-shared.ts` is only what a cold process sends before the first fetch. |
+
+## Commandcode Go and ZCode Start Plan
+
+Commandcode Go is a subscription tier of `commandcode`, not another provider.
+Requests use the CLI generation envelope and NDJSON response. Quota reads are
+organization-scoped; monthly allowance, purchased/free credits, and independent
+five-hour/weekly limits remain separate. Purchased credits are not capped by
+the monthly plan allowance. An unknown allowance cap does not erase a known
+spendable balance.
+An upstream reset timestamp of zero means no reset deadline is available, not
+a reset in January 1970.
+
+`zcode-start` (displayed as **ZCode Start**) is separate from `zcode` (the regular Z.AI Coding Plan). Sign in
+with its device flow or import the ZCode login JWT; a Coding Plan API key or
+the short-lived Z.AI access token is not interchangeable. There is no refresh
+grant: sign in again if the session is expired or revoked. Requests use
+`https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`, bearer auth,
+ZCode identity headers and the three-block client prompt. Caller instructions
+are appended inside the third block, not discarded or sent as a fourth block.
+
+Quota reads `GET /api/v1/zcode-plan/billing/balance`. Each balance keeps its
+`capabilities` model IDs, owning `user_plan_id`/`plan_id`, entitlement period,
+`total_units`, `used_units`, `remaining_units`, and activation/expiry times.
+Alternative grants can fund the same model; a spent grant cannot disable an
+unrelated model. Future grants show **Not started yet** and their start time,
+but cannot fund requests. Expired grants cannot fund requests even if their
+last reported remaining amount was positive. Missing usage is unknown, not zero.
+The dashboard summarizes multiple Start Plan grants as **Start +N** (no popup),
+with full upstream names in the badge title. Window headings show grant and
+period without a model caption. Known names are displayed as **Start** and
+**Global Build**; other promo/referral names remain unchanged. Stored quota
+and routing identities are not renamed. Future windows stay visible.
+Timeout, network and unreadable-JSON quota failures remain distinct; a timeout
+does not advance the account failure streak.
+A successful balance is authoritative: a model with no matching grant is not
+eligible. Dashboard availability follows the same grant lifetimes and treats
+same-model grants as alternatives, rather than showing a spent sibling as an
+account-wide zero balance.
+Generation business-error envelopes are failures even when the upstream HTTP
+status is 200; they must not produce successful empty completions.
+
+The **Claim gifts** button in the provider account row is an explicit manual
+action; quota cards do not expose gift claims. It reads marketing banners and billing preview, then
+posts each offered `plan_id` to `/api/v1/zcode-plan/billing/claim`. Claim codes
+`0`, `1003`, and `3007` mean claimed, already claimed, and CAPTCHA respectively.
+Complete CAPTCHA in the ZCode app. Unknown/unreadable replies are failures;
+mixed outcomes are partial, never an unconditional success. A successful
+no-data preview is a valid empty list. New grants invalidate both the live cache
+and the persisted quota snapshot used after a cold start.
+
+Automatic claims are **off by default**. Set `CARTETHYIA_ZCODE_AUTO_CLAIM=true`
+to opt active accounts in; the first pass runs after 24 hours and repeats daily.
+Each daily pass drains the eligible accounts in bounded pages; the page size
+does not defer the remaining accounts to another day.
+`CARTETHYIA_DISABLED_TASKS=zcode-gift-claim` still disables that task. Manual
+claim remains available independently. Disabled/cooling accounts are not
+automatically claimed, and this scheduler does not enable them.
+
+### Upstream reference
+
+The [Magpie ZCode integration](https://github.com/yetone/magpie) and its
+[`opencode-zcode-auth` package](https://www.npmjs.com/package/@magpie-community/opencode-zcode-auth/v/0.1.42)
+document the billing shapes, `capabilities` model mapping, legitimate empty
+preview and claim codes. Magpie's `-Trial` suffix distinguishes gifts from
+Coding Plan entries in its combined picker; upstream requests use raw model
+IDs. The separate `zcode-start` provider keeps those raw IDs without a fallback
+that spends the regular Coding Plan.
+
+Commandcode plan entitlement is model-specific: a `MODEL_NOT_IN_PLAN` refusal
+rests the selected model rather than invalidating the account. The provider's
+[Go plan roster](https://commandcode.ai/docs/plans/go) is the entitlement
+reference, not the unfiltered model catalog.
 
 ## Where to change what
 

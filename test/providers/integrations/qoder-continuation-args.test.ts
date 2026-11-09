@@ -102,8 +102,8 @@ test("index-identified continuation fragments rejoin the pinned call id", async 
     frame({}, "stop"),
   ]);
   const deltas = calls(ev);
-  // The tail hold means the JSON fragments may arrive spread or joined; every
-  // delta must reference the real call id, not a per-chunk `call_0` synthetic.
+  // Every delta must reference the pinned id, not a per-chunk `call_0`
+  // synthetic (the donor pins the first id per wire index).
   for (const delta of deltas) expect(delta["call_id"]).toBe("call_00_full");
   const joined = deltas
     .map((delta) => (delta["arguments_delta"] as string) ?? "")
@@ -145,6 +145,85 @@ test("a chunk carrying both id and arguments pins AND emits in one pass", async 
     frame(continuation('1}')),
   ]);
   expect(JSON.parse(calls(ev).map((d) => String(d["arguments_delta"])).join(""))).toEqual({ a: 1 });
+});
+
+test("continuation fragments carrying an empty id rejoin the pinned call", async () => {
+  // The qfmodel/qmodel_latest slots echo `id: ""` on every continuation chunk
+  // (the first chunk carries the real id). Treating the empty string as a
+  // fresh call id would orphan every argument fragment under `""` — the real
+  // call is then emitted with empty arguments and the fragments are lost. An
+  // empty id must behave exactly like a missing one and rejoin the pinned id.
+  const ev = await collect([
+    frame(CALL_START),
+    frame({
+      tool_calls: [
+        {
+          function: { arguments: '{"text":"a' },
+          id: "",
+          index: 0,
+          type: "function",
+        },
+      ],
+    }),
+    frame({
+      tool_calls: [
+        {
+          function: { arguments: 'b"}' },
+          id: "",
+          index: 0,
+          type: "function",
+        },
+      ],
+    }),
+  ]);
+  const deltas = calls(ev);
+  // Donor mirror: fragments are forwarded as separate deltas under the pinned
+  // id — the client stitches them. The start frame (empty arguments) and each
+  // continuation are all separate deltas, every one on the pinned id.
+  expect(deltas.length).toBeGreaterThanOrEqual(2);
+  for (const d of deltas) expect(d["call_id"]).toBe("call_00_full");
+  expect(JSON.parse(deltas.map((d) => String(d["arguments_delta"])).join(""))).toEqual({
+    text: "ab",
+  });
+});
+
+test("parallel calls with empty-id continuations keep distinct identities", async () => {
+  const secondStart: Record<string, unknown> = {
+    tool_calls: [
+      { function: { arguments: "", name: "write" }, id: "call_01_full", index: 1, type: "function" },
+    ],
+  };
+  const ev = await collect([
+    frame(CALL_START),
+    frame({
+      tool_calls: [
+        {
+          function: { arguments: '{"text":"a"}' },
+          id: "",
+          index: 0,
+          type: "function",
+        },
+      ],
+    }),
+    frame(secondStart),
+    frame({
+      tool_calls: [
+        {
+          function: { arguments: '{"path":"b"}' },
+          id: "",
+          index: 1,
+          type: "function",
+        },
+      ],
+    }),
+  ]);
+  const byId = new Map<string, string>();
+  for (const d of calls(ev)) {
+    const id = String(d["call_id"]);
+    byId.set(id, (byId.get(id) ?? "") + String(d["arguments_delta"]));
+  }
+  expect(byId.get("call_00_full")).toBe('{"text":"a"}');
+  expect(byId.get("call_01_full")).toBe('{"path":"b"}');
 });
 
 test("an empty-argument call is forwarded verbatim, not dropped", async () => {

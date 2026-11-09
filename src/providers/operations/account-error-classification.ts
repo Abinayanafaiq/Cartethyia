@@ -459,6 +459,26 @@ function banWording(lower: string): boolean {
 }
 
 /**
+ * Whether GitHub Copilot stated the account lacks a license — a ban-shaped
+ * verdict on the account, not a refreshable auth rejection.
+ *
+ * Observed live (2026-11-03): the health log showed
+ * `unauthorized: not licensed to use Copilot` and `forbidden` on
+ * `gpt-6-luna`. Copilot answers 401 for a bad credential and 403 for a
+ * license/entitlement refusal, so `forbidden`/`unauthorized` on this surface
+ * is the same verdict. No amount of waiting or refreshing changes it — the
+ * subscription cannot serve this credential.
+ */
+function copilotNotLicensed(lower: string): boolean {
+  return (
+    lower.includes("not licensed") ||
+    lower.includes("forbidden") ||
+    lower.includes("unauthorized") ||
+    lower.includes("license")
+  );
+}
+
+/**
  * Bounded to a day, matching `MAX_COOLDOWN_MS` in the failure policy: a stated
  * window longer than that is a monthly or plan-level limit, and parking an
  * account for a month on one upstream field is a decision for the operator,
@@ -804,6 +824,20 @@ export function classifyAccountError(
   const staticToken = options?.staticToken === true;
   const credentialKind = options?.credentialKind;
 
+  // Start Plan is a separate provider: its named trial refusal rests only that model.
+  const providerId = options?.providerId ?? (error instanceof GatewayError ? error.details.providerId : undefined);
+  const refusedModel = statusCode === 400
+    ? /no active limited quota for ([\w.-]+)/i.exec(message)?.[1]
+    : statusCode === 429
+      ? /limited quota(?: for)? ([\w.-]+)(?: is)? exhausted/i.exec(message)?.[1]
+      : undefined;
+  if (providerId === "zcode-start" && modelId !== undefined && refusedModel !== undefined &&
+    refusedModel.toLowerCase().replace(/-trial$/, "") === modelId.toLowerCase().replace(/-trial$/, "")) {
+    const cooldownMs = statedCooldownMs ?? DEFAULT_QUOTA_COOLDOWN_MS();
+    return result("model_unreachable", "cooldown", cooldownMs, new Date(Date.now() + cooldownMs),
+      reason("Start Plan trial unavailable for this model"), origin === "upstream");
+  }
+
   // A price refusal is a verdict on the *request*, not on the account. inferhub
   // answers 402 with `no provider's ask matches your max-per-mtok bid`: the
   // caller's own price ceiling was below every upstream ask, which says nothing
@@ -1077,7 +1111,8 @@ export function classifyAccountError(
   // for all other models. Disabling the whole account breaks healthy models.
   const modelEntitlementFailure =
     statusCode === 403 &&
-    (lower.includes("not have a valid license") ||
+    ((providerId === "commandcode" && lower.includes("model_not_in_plan")) ||
+      lower.includes("not have a valid license") ||
       lower.includes("valid license of this product") ||
       lower.includes("model not supported") ||
       lower.includes("not entitled to") ||
@@ -1245,6 +1280,33 @@ const ACCOUNT_ERROR_RULES: readonly AccountErrorRule[] = [
           : s.reason("Google account verification required"),
         // The upstream named the verdict; the account cannot serve until the
         // operator completes verification.
+        true,
+      ),
+  },
+  {
+    // GitHub Copilot answers a license/entitlement refusal with 403 and
+    // "not licensed to use Copilot" / "forbidden" / "unauthorized". That is a
+    // verdict on the account: the subscription cannot serve this credential,
+    // and no amount of waiting or refreshing changes it. Cooldown cycling
+    // (auth_invalidated + 5m backoff) kept a dead account in rotation where a
+    // client's retry budget burned sibling accounts — the same failure the
+    // buddy ban exists to prevent. Disable immediately. Must run before
+    // `credential-rejected`, which would claim the bare 403 as a refreshable
+    // auth rejection.
+    name: "github-copilot-not-licensed",
+    match: (s) =>
+      s.origin === "upstream" &&
+      s.providerId === "github" &&
+      copilotNotLicensed(s.lower),
+    decide: (s) =>
+      s.result(
+        "policy_blocked_banned",
+        "disabled",
+        0,
+        null,
+        s.reason("GitHub Copilot account not licensed"),
+        // A license refusal is evidence about the account even at provider
+        // scope, for the same reason a named revocation or a buddy ban is.
         true,
       ),
   },
@@ -1456,7 +1518,7 @@ const ACCOUNT_ERROR_RULES: readonly AccountErrorRule[] = [
   },
   {
     name: "quota-exhausted",
-    match: (s) => s.quotaSignal,
+    match: (s) => s.origin === "upstream" && s.quotaSignal,
     decide: (s) => {
       // xAI Grok Build's free tier resets on a rolling window. Use a duration
       // stated by the provider when present; otherwise park for the conservative
@@ -1510,6 +1572,7 @@ const ACCOUNT_ERROR_RULES: readonly AccountErrorRule[] = [
     // moves to the next account and the flagged one returns almost at once.
     name: "inception-per-minute-limit",
     match: (s) =>
+      s.origin === "upstream" &&
       s.providerId === "inception" &&
       (s.statusCode === 429 ||
         s.providerCode === "rate_limit_reached" ||
@@ -1534,15 +1597,16 @@ const ACCOUNT_ERROR_RULES: readonly AccountErrorRule[] = [
   {
     name: "rate-limit",
     match: (s) =>
-      s.statusCode === 429 ||
-      s.providerCode === "rate_limit_exceeded" ||
-      s.lower.includes("rate_limit") ||
-      s.lower.includes("rate limit") ||
-      s.lower.includes("too many requests") ||
-      s.lower.includes("requests per minute") ||
-      s.lower.includes("tokens per minute") ||
-      s.lower.includes("tpm limit") ||
-      s.lower.includes("rpm limit"),
+      s.origin === "upstream" &&
+      (s.statusCode === 429 ||
+        s.providerCode === "rate_limit_exceeded" ||
+        s.lower.includes("rate_limit") ||
+        s.lower.includes("rate limit") ||
+        s.lower.includes("too many requests") ||
+        s.lower.includes("requests per minute") ||
+        s.lower.includes("tokens per minute") ||
+        s.lower.includes("tpm limit") ||
+        s.lower.includes("rpm limit")),
     decide: (s) => {
       const cooldownMs = s.statedCooldownMs ?? DEFAULT_RATE_LIMIT_COOLDOWN_MS();
       // Same per-account reasoning as quota above: the failing account (or
@@ -1561,13 +1625,14 @@ const ACCOUNT_ERROR_RULES: readonly AccountErrorRule[] = [
   {
     name: "model-capacity",
     match: (s) =>
-      s.statusCode === 503 ||
-      s.statusCode === 529 ||
-      s.providerCode === "model_capacity" ||
-      s.queuedUpstream ||
-      s.lower.includes("model overloaded") ||
-      s.lower.includes("capacity exceeded") ||
-      s.lower.includes("temporarily unavailable"),
+      s.origin === "upstream" &&
+      (s.statusCode === 503 ||
+        s.statusCode === 529 ||
+        s.providerCode === "model_capacity" ||
+        s.queuedUpstream ||
+        s.lower.includes("model overloaded") ||
+        s.lower.includes("capacity exceeded") ||
+        s.lower.includes("temporarily unavailable")),
     decide: (s) => {
       const cooldownMs = s.statedCooldownMs ?? MODEL_CAPACITY_COOLDOWN_MS();
       const modelScopedMutation = s.origin === "upstream" && s.modelId !== undefined;

@@ -131,20 +131,20 @@ export const wireFamily = pgEnum("wire_family", ["chat", "responses", "messages"
 // `https` is a hosted relay front door (Vercel, Cloudflare, Deno, Netlify):
 // plain HTTP CONNECT to an origin that terminates TLS itself, so the transport
 // is recorded as what it speaks rather than as a generic proxy.
-const networkPoolKind = pgEnum("network_pool_kind", ["http", "https", "socks5"]);
+export const networkPoolKind = pgEnum("network_pool_kind", ["http", "https", "socks5"]);
 
 //  health_events.entity_kind — distinguishes which owning
 // table entity_id/account_id/network_pool_id references.
-const healthEntityKind = pgEnum("health_entity_kind", ["account", "pool"]);
+export const healthEntityKind = pgEnum("health_entity_kind", ["account", "pool"]);
 
-const telemetrySourceSurface = pgEnum("telemetry_source_surface", [
+export const telemetrySourceSurface = pgEnum("telemetry_source_surface", [
   "chat",
   "responses",
   "messages",
   "completion",
 ]);
 
-const telemetryStatus = pgEnum("telemetry_status", [
+export const telemetryStatus = pgEnum("telemetry_status", [
   "completed",
   "failed",
   "cancelled",
@@ -793,6 +793,12 @@ export const providerRoutingSettings = pgTable(
     // row that never set one is `buildClaudeCliUserAgent()` in
     // providers/operations/custom-cli-headers.ts, which this mirrors.
     userAgent: text("user_agent").notNull().default("claude-cli/2.1.293 (external, cli)"),
+    // Operator-set custom User-Agent, stored separately from the provider's
+    // native client identity (`user_agent`). NULL = no override — dispatch
+    // uses the native identity. A non-NULL value is an explicit override
+    // applied at the request edge, even when the provider would otherwise
+    // stamp its own identity.
+    customUserAgent: text("custom_user_agent"),
     // When true, this provider's requests always dial direct. When false,
     // dispatch automatically selects among every active network pool the
     // tenant owns (least-loaded/non-cooldown) — never an admin-pinned pool.
@@ -809,7 +815,7 @@ export const providerRoutingSettings = pgTable(
   }),
 );
 
-const poolRoutingStrategy = pgEnum("pool_routing_strategy", [
+export const poolRoutingStrategy = pgEnum("pool_routing_strategy", [
   "least_loaded",
   "round_robin",
   "random",
@@ -1458,7 +1464,7 @@ export const telemetryEvents = pgTable(
     outputTokens: integer("output_tokens"),
     reasoningTokens: integer("reasoning_tokens"),
     estimatedCostUsd: numeric("estimated_cost_usd", { precision: 12, scale: 6 }),
-    /** Provider-billed credits (Tencent buddy-meter `credit`); NULL when unreported. */
+    /** Provider-billed credits (Tencent buddy-meter `credit`, Qoder `credits`); NULL when unreported. */
     creditUsed: numeric("credit_used", { precision: 12, scale: 4 }),
     /**
      * Gateway-side time before the upstream dispatch began: routing,
@@ -1483,6 +1489,14 @@ export const telemetryEvents = pgTable(
      * tell "not configured" from "broken".
      */
     payloadCaptureState: text("payload_capture_state"),
+    /**
+     * Set for a completed request whose output is far smaller than what the
+     * model can produce AND which the model ended with an ordinary `stop`
+     * (a "degenerate stop"). Introduced to measure how often a model
+     * truncates itself on a cached prefix — the pattern that surfaced as
+     * short, cut-off chat replies. NULL/unset for everything else.
+     */
+    degenerateStop: boolean("degenerate_stop"),
   },
   (table) => [
     index("telemetry_events_created_at_idx").on(table.createdAt),

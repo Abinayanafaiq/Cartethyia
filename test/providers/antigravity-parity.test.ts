@@ -13,6 +13,7 @@ import {
   antigravityClaudeThinkingBeta,
   ANTIGRAVITY_CLAUDE_THINKING_BETA,
   getAntigravityUserAgent,
+  flattenAntigravitySchema,
   normalizeAntigravityToolSchema,
   normalizeAntigravityToolSchemas,
   orderAntigravityEndpoints,
@@ -287,6 +288,106 @@ describe("6. parametersJsonSchema normalization", () => {
       properties: { query: { type: "string" }, limit: { type: "integer" } },
       required: ["query"],
     });
+  });
+
+  test("flattenAntigravitySchema removes anyOf/oneOf and multi-type unions", () => {
+    // The Antigravity Claude-route upstream validates tool schemas as strict
+    // JSON Schema draft 2020-12 and refuses every `anyOf` / `oneOf` /
+    // multi-type `type: [...]` — verified live 2026-11-05 (OMP's `task`
+    // tool: `tools.7.custom.input_schema: JSON schema is invalid`).
+    const schema = {
+      type: "object",
+      properties: {
+        model: {
+          anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],
+        },
+        tags: { type: ["string", "null"] },
+        nested: {
+          type: "object",
+          properties: { n: { oneOf: [{ type: "number" }, { type: "string" }] } },
+        },
+      },
+      required: ["model"],
+    };
+    expect(flattenAntigravitySchema(schema)).toEqual({
+      type: "object",
+      properties: {
+        model: { type: "string" },
+        tags: { type: "string" },
+        nested: {
+          type: "object",
+          properties: { n: { type: "number" } },
+        },
+      },
+      required: ["model"],
+    });
+  });
+
+  test("flattenAntigravitySchema leaves a plain schema untouched (same serialization)", () => {
+    const schema = { type: "object", properties: { q: { type: "string" } }, required: ["q"] };
+    expect(flattenAntigravitySchema(schema)).toEqual(schema);
+  });
+
+  test("normalizeAntigravityToolSchemas flattens anyOf on the wire", () => {
+    const request = {
+      model: "claude-sonnet-4-6",
+      messages: [{ role: "user", content: [{ kind: "text", text: "hi" }] }],
+      stream: false,
+      generation_controls: {},
+      source_surface: "chat",
+      tools: [
+        {
+          name: "task",
+          description: "task",
+          jsonSchema: {
+            type: "object",
+            properties: {
+              model: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+            },
+          },
+        },
+      ],
+    } as unknown as CanonicalRequest;
+
+    const after = buildGeminiPayload(normalizeAntigravityToolSchemas(request))["tools"] as unknown;
+    const declaration = (after as Array<{ functionDeclarations?: Array<Record<string, unknown>> }>)?.[0]
+      ?.functionDeclarations?.[0];
+    expect(declaration?.["parameters"]).toEqual({
+      type: "object",
+      properties: { model: { type: "string" } },
+    });
+  });
+
+  test("web_search tool maps to Gemini's native googleSearch hosted tool", () => {
+    // Gemini grounds Google search through a *hosted* tool declaration
+    // (`{ googleSearch: {} }`), not a function declaration — sending the
+    // gateway's `web_search` tool as a function is why upstream answered with
+    // no grounding chunks (2026-11-04).
+    const request = {
+      model: "gemini-2.5-flash",
+      messages: [{ role: "user", content: [{ kind: "text", text: "hi" }] }],
+      stream: false,
+      generation_controls: {},
+      source_surface: "chat",
+      tools: [{ name: "web_search", tool_type: "web_search", jsonSchema: {} }],
+    } as unknown as CanonicalRequest;
+
+    const tools = buildGeminiPayload(request)["tools"] as unknown;
+    expect(tools).toEqual([{ googleSearch: {} }]);
+  });
+
+  test("googleSearch named tool also maps to the native hosted declaration", () => {
+    const request = {
+      model: "gemini-2.5-flash",
+      messages: [{ role: "user", content: [{ kind: "text", text: "hi" }] }],
+      stream: false,
+      generation_controls: {},
+      source_surface: "chat",
+      tools: [{ name: "googleSearch", jsonSchema: {} }],
+    } as unknown as CanonicalRequest;
+
+    const tools = buildGeminiPayload(request)["tools"] as unknown;
+    expect(tools).toEqual([{ googleSearch: {} }]);
   });
 });
 

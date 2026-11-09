@@ -101,6 +101,7 @@ export function useBanApiKey() {
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.banned });
     },
   });
 }
@@ -115,6 +116,7 @@ export function useUnbanApiKey() {
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.all });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.apiKeys.banned });
     },
   });
 }
@@ -198,6 +200,34 @@ export function useApiKeys() {
     queryKey: queryKeys.apiKeys.all,
     queryFn: (context) =>
       consoleRequest<unknown>("/api-keys", { signal: querySignal(context) }).then(assertApiKeys),
+    ...DASHBOARD_QUERY_OPTIONS,
+  });
+}
+
+/**
+ * Loads ALL tenant keys including share children (recipients of a share
+ * template). Used by the Banned Users search so a child key can be found and
+ * banned by hand — the main key list omits children.
+ */
+export function useAllApiKeys() {
+  return useQuery({
+    queryKey: [...queryKeys.apiKeys.all, "all"],
+    queryFn: (context) =>
+      consoleRequest<unknown>("/api-keys?includeChildren=1", { signal: querySignal(context) }).then(
+        assertApiKeys,
+      ),
+    ...DASHBOARD_QUERY_OPTIONS,
+  });
+}
+
+/** Loads active banned keys, including share recipients omitted from the main key list. */
+export function useBannedApiKeys() {
+  return useQuery({
+    queryKey: queryKeys.apiKeys.banned,
+    queryFn: (context) =>
+      consoleRequest<unknown>("/api-keys/banned", { signal: querySignal(context) }).then(
+        assertApiKeys,
+      ),
     ...DASHBOARD_QUERY_OPTIONS,
   });
 }
@@ -295,4 +325,3 @@ export function useRevokeSharedKey() {
     },
   });
 }
-

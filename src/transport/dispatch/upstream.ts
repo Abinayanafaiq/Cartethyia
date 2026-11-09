@@ -1,6 +1,6 @@
 import type { CanonicalEvent } from "../../protocol/canonical-model";
 import type { AttemptLeaseOwnership, ValidatedOutboundFetch, ValidatedOutboundHttp2Bidi } from "../../providers/provider-contracts";
-import type { ProviderContinuationScope } from "../../providers/provider-contracts";
+import type { ProviderCaptureExchange, ProviderContinuationScope } from "../../providers/provider-contracts";
 import { GATEWAY_SECURITY_HEADERS } from "../../security/outbound-headers";
 
 const FORWARDED_REQUEST_HEADERS = new Set([
@@ -42,6 +42,8 @@ export function buildUpstreamDispatchContext(input: {
   readonly requestId?: string;
   readonly userAgent?: string;
   readonly outboundFetch?: ValidatedOutboundFetch;
+  /** Capture sink for provider exchanges not visible to the HTTP fetch wrapper. */
+  readonly providerCapture?: ProviderCaptureExchange;
   /** Validated attachment egress that must not be wrapped by provider payload capture. */
   readonly outboundAttachmentFetch?: ValidatedOutboundFetch;
   /** Validated bidirectional HTTP/2 egress bound to the same selected pool. */
@@ -85,8 +87,10 @@ export function buildUpstreamDispatchContext(input: {
           const requestHeaders =
             init?.headers ?? (request instanceof Request ? request.headers : undefined);
           const headers = new Headers(requestHeaders);
-          // Provider identity is authoritative; route identity fills only a missing header.
-          if (!headers.has("user-agent")) headers.set("user-agent", userAgent);
+          // A route-level user agent is an explicit operator override: it
+          // replaces whatever identity the provider would otherwise send.
+          // Absent route identity leaves the provider's own header untouched.
+          if (userAgent) headers.set("user-agent", userAgent);
           return sourceFetch(request, { ...init, headers });
         }
       : sourceFetch;
@@ -98,6 +102,7 @@ export function buildUpstreamDispatchContext(input: {
     ...(userAgent ? { user_agent: userAgent } : {}),
     ...(Object.keys(input.headers).length > 0 ? { request_headers: input.headers } : {}),
     ...(outboundFetch ? { outbound_fetch: outboundFetch } : {}),
+    ...(input.providerCapture ? { provider_capture: input.providerCapture } : {}),
     ...(input.outboundAttachmentFetch
       ? { outbound_attachment_fetch: input.outboundAttachmentFetch }
       : {}),

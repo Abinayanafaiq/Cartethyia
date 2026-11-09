@@ -1,4 +1,4 @@
-import { ArrowRight, Copy, CopyPlus, Image as ImageIcon, Layers, Pencil, Plus, Route, Search, Trash2, X } from "lucide-react";
+import { ArrowRight, Copy, CopyPlus, HelpCircle, Image as ImageIcon, Layers, Pencil, Plus, Route, Search, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Button } from "../../components/ui/button";
 import { Card, CardBody, CardHeader } from "../../components/ui/card";
@@ -12,14 +12,18 @@ import { Inline, CardActions } from "../../components/ui/inline";
 import { ModelPickerModal, type FlatModelEntry } from "../../components/ModelPicker";
 import { SortableList } from "../../components/SortableList";
 import { ScopeInjectionField } from "../../components/ScopeInjectionField";
+import { EMPTY_STATE } from "../../components/InjectSystemPromptPanel";
 import { Stack } from "../../components/ui/stack";
 import { CodeChip } from "../../components/ui/code-chip";
 import { getErrorMessage } from "../../data/api";
+import { mergeBuiltinPresets } from "../../data/builtin-prompts";
+import { useSystemPrompt, useUpdateSystemPrompt } from "../../hooks/system-prompt";
 import { useTrackedTimeout } from "../../hooks/use-timeout";
 import { useClipboard } from "../../hooks/use-clipboard";
 import { toast } from "../../lib/toast";
 import { useRuntimeSettings, useUpdateRuntimeSettings } from "../../hooks/settings";
 import type { ComboStrategy, ModelAliasRow, ModelComboRow, UpdateRuntimeSettingsRequest } from "../../data/contracts";
+import type { ScopePromptRef } from "../../../../src/console/system-prompt/contracts";
 import { COMBO_STRATEGY_OPTIONS } from "./combo-strategy";
 import {
   useCloneModelCombo,
@@ -58,6 +62,11 @@ function AliasesSection(): ReactNode {
   const { copy } = useClipboard();
   const scheduleCopyReset = useTrackedTimeout();
 
+  const spQuery = useSystemPrompt();
+  const spUpdate = useUpdateSystemPrompt();
+  const spState = mergeBuiltinPresets(spQuery.data ?? EMPTY_STATE);
+  const [aliasScopeRef, setAliasScopeRef] = useState<ScopePromptRef>({ kind: "global" });
+
   const aliases = useMemo(() => aliasesQuery.data ?? [], [aliasesQuery.data]);
 
   const openCreate = () => {
@@ -71,6 +80,7 @@ function AliasesSection(): ReactNode {
     setEditingAlias(a);
     setAliasName(a.alias);
     setTargetModel(a.targetModel);
+    setAliasScopeRef(spState.aliases[a.alias] ?? { kind: "global" });
     setDialogOpen(true);
   };
 
@@ -82,13 +92,27 @@ function AliasesSection(): ReactNode {
       // Both fields are editable now: the alias name rides along with the
       // target, and the backend cascades a rename through alias chains and
       // combo members that referenced the old name.
+      const nextAlias = aliasName.trim();
       updateMutation.mutate(
         {
           id: editingAlias.id,
-          request: { alias: aliasName.trim(), targetModel: targetModel.trim() },
+          request: { alias: nextAlias, targetModel: targetModel.trim() },
         },
         {
           onSuccess: () => {
+            // Persist the inline system-prompt scope atomically with the alias
+            // save, moved to the final name when the alias was renamed.
+            const nextSP = {
+              ...spState,
+              aliases: { ...spState.aliases, [nextAlias]: aliasScopeRef },
+            };
+            if (editingAlias.alias !== nextAlias) {
+              delete nextSP.aliases[editingAlias.alias];
+            }
+            spUpdate.mutate(nextSP, {
+              onError: (error) =>
+                toast.error(getErrorMessage(error, "Could not update system prompt.")),
+            });
             setDialogOpen(false);
             setEditingAlias(null);
             toast.success("Alias updated");
@@ -259,7 +283,13 @@ function AliasesSection(): ReactNode {
             multi={false}
           />
           {editingAlias ? (
-            <ScopeInjectionField kind="alias" name={editingAlias.alias} />
+            <ScopeInjectionField
+              kind="alias"
+              name={editingAlias.alias}
+              value={aliasScopeRef}
+              onChange={setAliasScopeRef}
+              presets={spState.presets}
+            />
           ) : null}
         </form>
       </Dialog>
@@ -318,6 +348,7 @@ export function VisionHandoffSection(): ReactNode {
   const settingsQuery = useRuntimeSettings();
   const mutation = useUpdateRuntimeSettings();
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const settings = settingsQuery.data;
   const models = settings?.visionHandoffModels ?? [];
   // Mirrors the server setting. Deliberately not a `useState` initializer: the
@@ -382,11 +413,27 @@ export function VisionHandoffSection(): ReactNode {
   return (
     <Card>
       <CardHeader
-        title="Vision Handoff"
+        title={
+          <span className="inline-flex items-center gap-2.5">
+            Vision Handoff
+            <span className="badge border border-warning-line bg-surface-2 text-micro tracking-label text-status-warning">
+              BETA
+            </span>
+          </span>
+        }
         subtitle="When the selected model cannot see images, describe them with a vision model first"
         icon={<ImageIcon size={16} />}
         action={
           <CardActions>
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<HelpCircle size={14} />}
+              aria-label="How vision handoff works"
+              onClick={() => setHelpOpen(true)}
+            >
+              How it works
+            </Button>
             <Button
               variant="secondary"
               size="sm"
@@ -442,6 +489,35 @@ export function VisionHandoffSection(): ReactNode {
         multi
         filter={isVisionModel}
       />
+      <Dialog
+        open={helpOpen}
+        onClose={() => setHelpOpen(false)}
+        title="How vision handoff works"
+        size="md"
+      >
+        <div className="flex flex-col gap-4 text-badge leading-relaxed text-text-secondary">
+          <p>
+            <strong>Vision handoff</strong> lets a text-only model still answer
+            when a request carries images. The gateway sends the image to the
+            first healthy model on your list and injects its description as
+            text back into the conversation — the chosen model never sees the
+            raw image, only the description.
+          </p>
+          <p>
+            The list is ordered: drag models to set priority. The first healthy
+            model wins; if it fails (cooldown, quota, upstream error), the
+            handoff falls to the next entry.
+          </p>
+          <p>
+            <strong>Empty list</strong> keeps the legacy{' '}
+            <code>[image]</code> placeholder behavior — the raw image marker is
+            passed through instead of a description.
+          </p>
+          <p className="text-micro text-text-tertiary">
+            Only image-capable chat models are offered in the picker.
+          </p>
+        </div>
+      </Dialog>
     </Card>
   );
 }
@@ -474,6 +550,11 @@ function CombosSection(): ReactNode {
   const { copy } = useClipboard();
   const scheduleCopyReset = useTrackedTimeout();
 
+  const spQuery = useSystemPrompt();
+  const spUpdate = useUpdateSystemPrompt();
+  const spState = mergeBuiltinPresets(spQuery.data ?? EMPTY_STATE);
+  const [comboScopeRef, setComboScopeRef] = useState<ScopePromptRef>({ kind: "global" });
+
   const memberValues = useMemo(() => members.map((m) => m.value), [members]);
 
   /**
@@ -501,6 +582,7 @@ function CombosSection(): ReactNode {
   const openEdit = (c: ModelComboRow) => {
     setEditingCombo(c);
     setComboName(c.name);
+    setComboScopeRef(spState.combos[c.name] ?? { kind: "global" });
     // A fresh id per row keeps SortableList stable across dialog (re)opens —
     // reusing ids from a prior open would let React's reconciliation reorder
     // lookups hit a stale tree and lose the chip an operator is mid-drag.
@@ -536,17 +618,31 @@ function CombosSection(): ReactNode {
     if (editingCombo) {
       // Rename rides along with the member/strategy edit; the backend cascades
       // the name change through aliases and nested combos.
+      const nextName = comboName.trim();
       updateMutation.mutate(
         {
           id: editingCombo.id,
           request: {
-            name: comboName.trim(),
+            name: nextName,
             members: memberValues,
             strategy,
           },
         },
         {
           onSuccess: () => {
+            // Persist the inline system-prompt scope atomically with the combo
+            // save, moved to the final name when the combo was renamed.
+            const nextSP = {
+              ...spState,
+              combos: { ...spState.combos, [nextName]: comboScopeRef },
+            };
+            if (editingCombo.name !== nextName) {
+              delete nextSP.combos[editingCombo.name];
+            }
+            spUpdate.mutate(nextSP, {
+              onError: (error) =>
+                toast.error(getErrorMessage(error, "Could not update system prompt.")),
+            });
             setDialogOpen(false);
             setEditingCombo(null);
             toast.success("Combo saved");
@@ -727,7 +823,13 @@ function CombosSection(): ReactNode {
             options={COMBO_STRATEGY_OPTIONS}
           />
           {editingCombo ? (
-            <ScopeInjectionField kind="combo" name={editingCombo.name} />
+            <ScopeInjectionField
+              kind="combo"
+              name={editingCombo.name}
+              value={comboScopeRef}
+              onChange={setComboScopeRef}
+              presets={spState.presets}
+            />
           ) : null}
           <Stack gap="6px">
             <div className="flex items-center justify-between">

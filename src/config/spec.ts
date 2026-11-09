@@ -89,11 +89,12 @@ export const CONFIG_SPEC = {
   CARTETHYIA_API_KEY: { kind: "optional-text" },
   CARTETHYIA_SERVER_MAX_BODY_BYTES: {
     kind: "int",
-    // A 500K-token context is roughly 2 MB of text, so 4 MB admits every real
-    // request while halving the worst-case hold. How many may be in flight is
-    // admission's job, so an operator with larger payloads raises this and
-    // sets the ceiling in Settings.
-    default: 4 * 1024 * 1024,
+    // A 1M-token context is roughly 4+ MB of text (Qoder gRPC/legacy paths
+    // accept it), so 16 MB admits every real request while bounding the
+    // worst-case hold. How many may be in flight is admission's job, so an
+    // operator with even larger payloads raises this and sets the ceiling in
+    // Settings.
+    default: 16 * 1024 * 1024,
     min: 1024,
     max: Number.MAX_SAFE_INTEGER,
   },
@@ -173,6 +174,12 @@ export const CONFIG_SPEC = {
   CARTETHYIA_DISABLED_TASKS: { kind: "list" },
 
   /**
+   * Force the Qoder UMID bridge to the mini-ELF bundle on Linux
+   * (`1` = always mini, `0` = never mini; absent = auto-detect containers).
+   */
+  CARTETHYIA_QODER_UMID_MINI: { kind: "int", default: 0, min: 0, max: 1 },
+
+  /**
    * How long a day's telemetry is kept, in days.
    *
    * Whole raw event files past this age are removed. No summary or compacted
@@ -188,6 +195,13 @@ export const CONFIG_SPEC = {
     min: 1 * 1024 * 1024,
     max: 16 * 1024 * 1024,
   },
+  // Input-token accounting for usage display. Providers disagree on whether
+  // `input_tokens` already includes cached tokens: OpenAI/DeepSeek report the
+  // inclusive total with a cached subset, while Anthropic reports fresh-only
+  // with cache reads separate. `inclusive` (default) folds cache into input so
+  // every provider reads alike — IN is always the whole prompt and CACHED its
+  // subset. `as-is` keeps the raw upstream semantics.
+  CARTETHYIA_USAGE_INPUT_MODE: { kind: "text", default: "inclusive" },
 
   // Upstream request timeout + retry backoff
   //
@@ -262,7 +276,7 @@ export const CONFIG_SPEC = {
   CARTETHYIA_PROXY_MAX_FREE_SOCKETS: { kind: "int", default: 20, min: 0, max: 100_000 },
 
   // Security (encryption key, public origin, abuse ceiling)
-  IP_RATE_MAX_PER_WINDOW: { kind: "int", default: 240, min: 1, max: Number.MAX_SAFE_INTEGER },
+  IP_RATE_MAX_PER_WINDOW: { kind: "int", default: 540, min: 1, max: Number.MAX_SAFE_INTEGER },
   CARTETHYIA_ENCRYPTION_KEY: {
     kind: "required",
     error:
@@ -297,6 +311,20 @@ export const CONFIG_SPEC = {
    * an operator on one has no other way to point the login at it.
    */
   CARTETHYIA_GITHUB_ENTERPRISE_DOMAIN: { kind: "text", default: "" },
+  /**
+   * Which wire identity the GitHub Copilot Auto/chat path presents to the
+   * upstream:
+   *
+   * - `opencode-copilot` (default): the long-lived GitHub OAuth token + minimal
+   *   OpenCode headers. One token, no mint step, no short-lived minted-token
+   *   expiry. This is the most stable in practice.
+   * - `vscode-client-real`: a freshly minted Copilot token + the full VS Code
+   *   reference headers. Matches the VS Code client exactly, but requires the
+   *   minted token (expires ~25 min) and the reference identity.
+   */
+  CARTETHYIA_GITHUB_COPILOT_MODE: { kind: "text", default: "opencode-copilot" },
+  // Only the literal true opts active ZCode accounts into daily gift claims.
+  CARTETHYIA_ZCODE_AUTO_CLAIM: { kind: "text", default: "false" },
   /**
    * Free-tier OpenCode ids the listing still advertises but upstream refuses.
    * Replaces the bundled list outright; the single token `none` trusts the

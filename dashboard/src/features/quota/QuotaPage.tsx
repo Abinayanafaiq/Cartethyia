@@ -47,23 +47,18 @@ import {
 import {
   friendlyQuotaError,
   formatQuotaRefresh,
+  formatQuotaPlanLabel,
   formatQuotaWindowLabel,
   formatResetDistance,
   quotaBarTone,
+  quotaWindowState,
+  quotaPillSummary,
   paginateQuotaWindows,
   accountIdentity,
 } from "../../lib/format/quota";
 import { getErrorMessage } from "../../data/api";
 
 
-function isEmpty(account: QuotaEntry): boolean {
-  return Boolean(
-    account.quota?.windows.length &&
-    account.quota.windows.every(
-      (window) => window.remainingPercent !== null && window.remainingPercent <= 0,
-    ),
-  );
-}
 
 function firstResetAt(account: QuotaEntry): number {
   const resetTimes =
@@ -360,6 +355,7 @@ function QuotaCard({
       : "Check-in due";
   const statusHint = `${checkinHint}${lastReported ? " · Reported today" : ""}`;
   const totalCredits = quotaWindows.reduce((total, window) => {
+    if (quotaWindowState(window) !== "current") return total;
     const limit = window.limit;
     if (typeof limit !== "number" || !Number.isFinite(limit)) return total;
     const remaining =
@@ -388,14 +384,14 @@ function QuotaCard({
       {/* Header: icon + provider name + plan + account hint + actions */}
       <div className="flex flex-wrap items-center gap-5 px-7 py-4">
         <ProviderIcon icon={account.providerIcon} name={account.providerName} size={32} />
-        <div className="flex-[1_1_160px]">
+        <div className="min-w-0 flex-[1_1_160px]">
           <div className="flex min-w-0 items-center gap-4">
             <div className="truncate text-caption font-bold text-text-primary text-body">
               {account.providerName}
             </div>
             {quota?.plan && (
-              <span className="shrink-0 rounded-chip bg-accent-soft px-4 py-1 text-micro font-semibold text-accent">
-                {quota.plan}
+              <span title={quota.plan} className="min-w-0 max-w-44 truncate rounded-chip bg-accent-soft px-4 py-1 text-micro font-semibold text-accent">
+                {formatQuotaPlanLabel(quota.plan, quota.source)}
               </span>
             )}
           </div>
@@ -578,9 +574,22 @@ function QuotaCard({
             QUOTA WINDOWS
           </div>
           {pagination.items.map((window, index) => {
+            const state = quotaWindowState(window);
+            if (state !== "current") {
+              return (
+                <div key={`${window.kind ?? window.label}:${window.startsAt}:${index}`} className="flex flex-col gap-2 text-badge">
+                  <span title={window.label} className="break-words font-semibold text-text-primary">{formatQuotaWindowLabel(window.label, quota.source, window.modelIds)}</span>
+                  <span className="text-text-tertiary">{state === "expired" ? "Expired" : `Not started yet · Starts ${new Date(window.startsAt!).toLocaleString()}`}</span>
+                </div>
+              );
+            }
             const remaining = window.remainingPercent ?? null;
             const limit =
               typeof window.limit === "number" && Number.isFinite(window.limit) ? window.limit : null;
+            const remainingCredits =
+              typeof window.remaining === "number" && Number.isFinite(window.remaining)
+                ? window.remaining
+                : null;
             const usedCredits =
               typeof window.used === "number" && Number.isFinite(window.used)
                 ? window.used
@@ -596,14 +605,14 @@ function QuotaCard({
               if (rounded > 0 && rounded < 0.1) return "<0.1";
               return rounded.toLocaleString(undefined, { maximumFractionDigits: 1 });
             };
-            const label = formatQuotaWindowLabel(window.label);
+            const label = formatQuotaWindowLabel(window.label, quota.source, window.modelIds);
             return (
               <div
                 className="quota-window-row grid grid-cols-quota-window min-w-0 items-center gap-x-6 gap-y-2 max-small:grid-cols-[minmax(0,1fr)_auto] max-small:gap-x-4 max-small:gap-y-2.5"
                 key={`${window.kind ?? window.label}:${window.resetsAt ?? "none"}:${index}`}
               >
                 <div className="quota-window-heading min-w-0 max-small:col-start-1">
-                  <span className="text-badge font-semibold text-text-primary">
+                  <span title={window.label} className="break-words text-badge font-semibold text-text-primary">
                     {label}
                   </span>
                 </div>
@@ -614,7 +623,7 @@ function QuotaCard({
                   aria-valuemin={0}
                   aria-valuemax={100}
                   aria-valuenow={remaining === null ? undefined : quotaFillPct}
-                  aria-valuetext={remaining === null ? "Quota only" : `${formatPercent(remaining)}% remaining`}
+                  aria-valuetext={remaining === null ? remainingCredits !== null ? `${formatAmount(remainingCredits)} credits remaining` : "Quota only" : `${formatPercent(remaining)}% remaining`}
                 >
                   <div
                     className="quota-bar-fill h-full rounded-tiny transition-[width] duration-(--dur-macro) ease-spring"
@@ -625,13 +634,13 @@ function QuotaCard({
                   className="quota-window-remaining whitespace-nowrap text-badge font-bold tabular-nums max-small:col-start-2 max-small:row-start-1"
                   style={{ color: colors.text }}
                 >
-                  {remaining === null ? "—" : `${formatPercent(remaining)}%`}
+                  {remaining === null ? remainingCredits !== null ? `${formatAmount(remainingCredits)} left` : "—" : `${formatPercent(remaining)}%`}
                 </span>
                 <div className="quota-window-details col-span-full flex min-w-0 items-center justify-end gap-6 text-micro text-text-tertiary max-small:row-start-3 max-small:flex-wrap max-small:justify-between max-small:gap-4">
                   <span className="quota-window-usage mr-auto tabular-nums max-small:min-w-0">
                     {usedCredits !== null && limit !== null
                       ? `${formatAmount(usedCredits)} / ${formatAmount(limit)} Credits`
-                      : "Quota only"}
+                      : remainingCredits !== null ? `${formatAmount(remainingCredits)} Credits remaining` : "Quota only"}
                   </span>
                   {window.resetsAt && (
                     <span className="quota-window-reset whitespace-nowrap tabular-nums text-right max-small:ml-auto">
@@ -767,7 +776,7 @@ export default function QuotaPage(): ReactNode {
   };
 
   const turnOffEmpty = async () => {
-    const targets = accounts.filter((account) => account.active && isEmpty(account));
+    const targets = accounts.filter((account) => account.active && quotaPillSummary(account.quota?.windows ?? []).empty);
     await setActiveBatch.mutateAsync({ ids: targets.map((target) => target.id), active: false });
     toast.success(`Disabled ${targets.length} empty accounts`);
   };
@@ -776,9 +785,7 @@ export default function QuotaPage(): ReactNode {
     const targets = accounts.filter(
       (account) =>
         !account.active &&
-        account.quota?.windows.some(
-          (window) => window.remainingPercent !== null && window.remainingPercent > 0,
-        ),
+        quotaPillSummary(account.quota?.windows ?? []).available,
     );
     await setActiveBatch.mutateAsync({ ids: targets.map((target) => target.id), active: true });
     toast.success(`Enabled ${targets.length} available accounts`);
@@ -796,7 +803,7 @@ export default function QuotaPage(): ReactNode {
           minute: "2-digit",
         })
       : "Not updated";
-  const emptyCount = accounts.filter(isEmpty).length;
+  const emptyCount = accounts.filter((account) => quotaPillSummary(account.quota?.windows ?? []).empty).length;
 
   return (
     <Stack gap="16px" className="dashboard-page min-h-0 flex-1">

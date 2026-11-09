@@ -1,4 +1,4 @@
-import { ChevronDown, Eye, EyeOff, Plus, Server, Trash2 } from "lucide-react";
+import { ChevronDown, Eye, EyeOff, LayoutGrid, Plus, Rows3, Server, Trash2 } from "lucide-react";
 import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import { cn } from "../../lib/classnames";
 import { Link, useSearchParams } from "react-router-dom";
@@ -19,6 +19,7 @@ import { Input } from "../../components/ui/input";
 import { Select } from "../../components/ui/select";
 import { EmptyState, ErrorState, LoadingState } from "../../components/ui/state";
 import { Switch } from "../../components/ui/switch";
+import { PaginationControls } from "../../components/ui/pagination";
 import { Inline } from "../../components/ui/inline";
 import { Stack } from "../../components/ui/stack";
 import { useHideUnconfiguredProviders } from "../../lib/privacy-mode";
@@ -67,10 +68,10 @@ const ENDPOINT_TAIL = /\/(?:v\d+\/)?(?:messages|chat\/completions|responses|comp
  * The root to use when the typed Base URL ends at a per-request endpoint, or
  * null when it already looks like a root.
  *
- * The suggestion is the bare origin, matching the server's
- * `splitEndpointBaseUrl`: for `…/anthropic/v1/messages` the whole path belongs
- * to that endpoint, and offering `…/anthropic` would still derive the model
- * list at `…/anthropic/models` and fail.
+ * Only the endpoint **tail** is stripped; any gateway prefix before it survives.
+ * For `…/anthropic/v1/messages` the suggestion is `…/anthropic` (LongCat-style
+ * prefix), matching the server's `splitEndpointBaseUrl` so the dashboard warns
+ * about the same root the gateway would test against.
  */
 function pastedEndpointRoot(value: string): string | null {
   const trimmed = value.trim().replace(/\/+$/, "");
@@ -83,7 +84,10 @@ function pastedEndpointRoot(value: string): string | null {
   } catch {
     return null;
   }
-  return ENDPOINT_TAIL.test(pathname) ? url.origin : null;
+  const match = ENDPOINT_TAIL.exec(pathname);
+  if (match === null) return null;
+  const kept = pathname.slice(0, match.index);
+  return `${url.origin}${kept}`;
 }
 
 
@@ -665,6 +669,8 @@ const FREE_LIMITED_IDS = new Set([
   // rather than a daily allowance, but it belongs in the same section as the
   // other free-limited providers an operator reaches for first.
   "inception",
+  // ZCode Start exposes account-specific, time-limited GLM grants.
+  "zcode-start",
 ]);
 /**
  * The providers an operator reaches for first: household names with a
@@ -893,6 +899,27 @@ function compareConfiguredProviders(a: ProviderResponse, b: ProviderResponse): n
   return (a.label || a.displayName).localeCompare(b.label || b.displayName);
 }
 const COLLAPSED_SECTIONS_KEY = "cartethyia.providerSectionsCollapsed";
+const SHOW_ALL_SECTIONS_KEY = "cartethyia:providers:display-mode";
+
+function readShowAllSections(): boolean | null {
+  try {
+    if (typeof window === "undefined") return null;
+    const stored = window.localStorage.getItem(SHOW_ALL_SECTIONS_KEY);
+    if (stored === "all") return true;
+    if (stored === "paginated") return false;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function writeShowAllSections(showAll: boolean): void {
+  try {
+    window.localStorage.setItem(SHOW_ALL_SECTIONS_KEY, showAll ? "all" : "paginated");
+  } catch {
+    // Keep the current in-memory choice when browser storage is unavailable.
+  }
+}
 
 /**
  * The section default-collapsed on first visit (G-05 d1). It is the largest
@@ -1046,6 +1073,36 @@ export default function Providers(): ReactNode {
     })).filter((section) => section.providers.length > 0);
   }, [llmProviders, orderedSearch, mediaProviders, tab]);
 
+  /** Providers shown per section; `section.providers` is sliced to the page
+   *  so a large catalog never renders hundreds of cards at once. */
+  const SECTION_PAGE_SIZE = 8;
+  const [sectionPages, setSectionPages] = useState<Readonly<Record<string, number>>>({});
+  // When set, every section renders all its providers (pagination disabled).
+  const [showAllSections, setShowAllSections] = useState(() => readShowAllSections() ?? false);
+  const toggleShowAllSections = () => {
+    setShowAllSections((current) => {
+      const next = !current;
+      writeShowAllSections(next);
+      return next;
+    });
+  };
+  const pageFor = (title: string) => sectionPages[title] ?? 1;
+  const setPageFor = (title: string) => (page: number) =>
+    setSectionPages((current) => ({ ...current, [title]: page }));
+  const visibleProvidersFor = (providers: readonly ProviderResponse[], title: string) => {
+    if (showAllSections) {
+      return { visible: providers, pageCount: 1, safePage: 1 };
+    }
+    const page = pageFor(title);
+    const pageCount = Math.max(1, Math.ceil(providers.length / SECTION_PAGE_SIZE));
+    const safePage = Math.min(page, pageCount);
+    return {
+      visible: providers.slice((safePage - 1) * SECTION_PAGE_SIZE, safePage * SECTION_PAGE_SIZE),
+      pageCount,
+      safePage,
+    };
+  };
+
   const state = q.isPending && !q.data
     ? <LoadingState label="Loading providers..." />
     : q.isError
@@ -1105,6 +1162,19 @@ export default function Providers(): ReactNode {
         >
           {hideUnconfiguredOn ? "Show unconfigured" : "Hide unconfigured"}
         </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          icon={showAllSections ? <Rows3 size={12} /> : <LayoutGrid size={12} />}
+          onClick={toggleShowAllSections}
+          title={
+            showAllSections
+              ? "Paginate each section (8 per page)"
+              : "Show every provider in each section at once"
+          }
+        >
+          {showAllSections ? "Paginated" : "Show All"}
+        </Button>
         <span className="ml-auto text-micro text-text-tertiary">
           {tab === "search"
             ? "Fallback runs only when the model invokes Websearch"
@@ -1159,7 +1229,7 @@ export default function Providers(): ReactNode {
 
             {collapsed ? null : (
             <ProviderCardGrid>
-              {section.providers.map((p) => (
+              {visibleProvidersFor(section.providers, section.title).visible.map((p) => (
                 <ProviderCard
                   key={p.providerId}
                   provider={p}
@@ -1176,6 +1246,19 @@ export default function Providers(): ReactNode {
               ))}
             </ProviderCardGrid>
             )}
+            {!collapsed ? (
+              (() => {
+                const { pageCount, safePage } = visibleProvidersFor(section.providers, section.title);
+                return pageCount > 1 ? (
+                  <PaginationControls
+                    page={safePage}
+                    pageCount={pageCount}
+                    onPageChange={setPageFor(section.title)}
+                    testId={`providers-section-pagination-${section.title}`}
+                  />
+                ) : null;
+              })()
+            ) : null}
           </section>
           );
         })

@@ -12,6 +12,7 @@ const settings = (patch: Partial<LabRequestSettings> = {}): LabRequestSettings =
   protocol: "chat",
   persona: "cartethyia",
   model: "openai/gpt-4.1",
+  maxOutputTokens: 131_072,
   systemPrompt: "",
   temperature: "",
   topP: "",
@@ -64,8 +65,24 @@ describe("buildLabRequest", () => {
     const messages = buildLabRequest(turns, settings({ protocol: "messages", persona: "unset", systemPrompt: "stay on topic" }));
     expect(messages.path).toBe("/v1/messages");
     expect(messages.body.system).toBe("stay on topic");
-    expect(messages.body.max_tokens).toBe(4096);
+    // The model catalog output ceiling replaces the fixed 4096 default.
+    expect(messages.body.max_tokens).toBe(131_072);
     expect(messages.body.messages).toEqual([{ role: "user", content: "draw a cat" }]);
+  });
+
+  test("chat and responses carry the catalog output ceiling", () => {
+    const turns = [{ role: "user" as const, text: "draw a cat" }];
+    const chat = buildLabRequest(turns, settings({ protocol: "chat" }));
+    expect(chat.path).toBe("/v1/chat/completions");
+    expect(chat.body.max_tokens).toBe(131_072);
+
+    const responses = buildLabRequest(turns, settings({ protocol: "responses", effort: "high" }));
+    expect(responses.path).toBe("/v1/responses");
+    expect(responses.body.max_output_tokens).toBe(131_072);
+
+    const noLimit = buildLabRequest(turns, settings({ maxOutputTokens: undefined }));
+    expect(noLimit.body.max_tokens).toBeUndefined();
+    expect(noLimit.body.max_output_tokens).toBeUndefined();
   });
 
   test("the default persona stays stable across turns and combines the user's prompt across all wires", () => {
@@ -411,6 +428,20 @@ describe("buildLabRequest", () => {
       expect(detectMediaIntent("What is an image model good at?")).toBeUndefined();
     });
 
+    test("does not mistake discussions that merely mention media for a request", () => {
+      // Regression: long prompts that explain or ask about image/video
+      // generation must not trigger the media pipeline — the planner answers
+      // them instead, and "model asked for" decides tool use.
+      expect(detectMediaIntent("Explain how to create a good prompt for generating images with AI")).toBeUndefined();
+      expect(detectMediaIntent("How do I generate an image?")).toBeUndefined();
+      expect(detectMediaIntent("Tolong jelaskan cara membuat aplikasi yang menampilkan gambar")).toBeUndefined();
+      expect(detectMediaIntent("I want to make a website that shows images uploaded by users")).toBeUndefined();
+      expect(detectMediaIntent("Draw conclusions from this data")).toBeUndefined();
+      // Short, direct requests still work.
+      expect(detectMediaIntent("Buatkan gambar logo sederhana")).toBe("image");
+      expect(detectMediaIntent("gambarkan kucing")).toBe("image");
+    });
+
     test("falls back to the native worker unless the planner called the requested media tool", () => {
       expect(shouldFallbackToMediaWorker("image", [])).toBe(true);
       expect(shouldFallbackToMediaWorker("image", [{ name: "web_search" }])).toBe(true);
@@ -534,6 +565,14 @@ describe("buildLabRequest", () => {
         videoCount: "1",
       });
       expect(migrated).not.toHaveProperty("mode");
+
+      // Regression: an unset (empty) image worker must stay unset — it is never
+      // auto-selected, matching the video worker. This is what keeps the
+      // `generate_image` tool out of the planner's toolset until the operator
+      // explicitly chooses a worker.
+      expect(migrated?.imageWorkerModel).toBe("");
+      expect(migrated?.videoWorkerModel).toBe("");
+
       const configured = migrateLabSessionRecord({
         id: "configured",
         title: "configured",

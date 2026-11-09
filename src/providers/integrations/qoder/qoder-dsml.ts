@@ -24,6 +24,8 @@
  * only when exactly one declared tool fits.
  */
 import { randomUUID } from "node:crypto";
+import { GatewayError } from "../../../protocol/gateway-error";
+import type { CanonicalEvent } from "../../../protocol/canonical-model";
 
 export interface QoderDsmlCall {
   readonly id: string;
@@ -263,4 +265,120 @@ export function parseQoderDsml(
 /** True when the buffer clearly attempted a DSML tool call (has an invoke or parameter tag). */
 export function isQoderDsmlAttempt(text: string): boolean {
   return tokenize(text).some((t) => t.kind === "invoke" || t.kind === "parameter");
+}
+
+/** Cap on a held DSML block; past it the turn fails closed instead of buffering forever. */
+const DSML_HOLD_MAX_CHARS = 4 * 1024 * 1024;
+
+const DSML_UNRECOVERABLE_MESSAGE =
+  "Qoder returned an unparseable tool-call echo (request {requestId}); no tools were emitted. The upstream came back empty-handed — retry 🌙";
+
+function dsmlUnrecoverableError(): GatewayError {
+  return new GatewayError(
+    "platform_unavailable",
+    502,
+    DSML_UNRECOVERABLE_MESSAGE,
+    { providerId: "qoder" },
+    "upstream",
+  );
+}
+
+/**
+ * Wraps one Qoder canonical event stream (gRPC, IDE, or COSY surface) and
+ * turns DSML markup written into the text stream back into tool calls.
+ *
+ * Everything from the first DSML tag on is held; a possible partial tag split
+ * across frames (`<｜｜DS`) is held until the next text piece decides it. At
+ * the terminal event (or end of stream) the held block is parsed: recovered
+ * calls are emitted as `tool_call_delta` before the terminal, which then
+ * carries `tool_use`; an unmistakable DSML call that cannot be recovered fails
+ * the turn (502, retryable) instead of leaking markup to the client; anything
+ * else is released as ordinary text. A stream with no DSML passes through
+ * unchanged apart from sequence numbers, which are renumbered so inserted
+ * events keep the order strict.
+ */
+export async function* recoverQoderDsmlEvents(
+  events: AsyncIterable<CanonicalEvent>,
+  tools: readonly QoderDsmlTool[],
+): AsyncGenerator<CanonicalEvent> {
+  let seq: number | undefined;
+  const next = (event: CanonicalEvent): CanonicalEvent => {
+    seq = seq === undefined ? event.sequence_number : seq + 1;
+    return { ...event, sequence_number: seq } as CanonicalEvent;
+  };
+  const text = (value: string): CanonicalEvent =>
+    next({ type: "content_delta", sequence_number: 0, content: { kind: "text", text: value } } as CanonicalEvent);
+  let held = "";
+  let tail = "";
+  const callIds = new Set<string>();
+  let recoveredCalls = false;
+
+  function* flush(): Generator<CanonicalEvent> {
+    if (tail.length > 0) {
+      if (held.length > 0) held += tail;
+      else yield text(tail);
+      tail = "";
+    }
+    if (held.length === 0) return;
+    const block = held;
+    held = "";
+    const recovered = parseQoderDsml(block, tools);
+    if (recovered !== null) {
+      const prose = `${recovered.before}${recovered.after}`.trim();
+      if (prose.length > 0) yield text(prose);
+      for (const call of recovered.calls) {
+        yield next({
+          type: "tool_call_delta",
+          sequence_number: 0,
+          call_id: call.id,
+          index: callIds.size,
+          name: call.name,
+          arguments_delta: call.arguments,
+        } as CanonicalEvent);
+        callIds.add(call.id);
+      }
+      recoveredCalls = recovered.calls.length > 0;
+      return;
+    }
+    if (isQoderDsmlAttempt(block)) throw dsmlUnrecoverableError();
+    yield text(block);
+  }
+
+  for await (const event of events) {
+    if (event.type === "content_delta" && event.content.kind === "text") {
+      let piece = tail + event.content.text;
+      tail = "";
+      if (held.length > 0) {
+        held += piece;
+        if (held.length > DSML_HOLD_MAX_CHARS) throw dsmlUnrecoverableError();
+        continue;
+      }
+      const at = findDsmlStart(piece);
+      if (at >= 0) {
+        if (at > 0) yield text(piece.slice(0, at));
+        held = piece.slice(at);
+        continue;
+      }
+      const partial = dsmlPartialTail(piece);
+      if (partial.length > 0) {
+        tail = partial;
+        piece = piece.slice(0, piece.length - partial.length);
+      }
+      if (piece.length > 0) yield text(piece);
+      continue;
+    }
+    if (event.type === "tool_call_delta") callIds.add(event.call_id);
+    if (event.type === "terminal") {
+      yield* flush();
+      if (recoveredCalls && event.state === "complete") {
+        yield next({ ...event, stop_reason: "tool_use", provider_stop_reason: "tool_calls" } as CanonicalEvent);
+      } else {
+        yield next(event);
+      }
+      recoveredCalls = false;
+      continue;
+    }
+    yield next(event);
+  }
+  yield* flush();
 }

@@ -89,6 +89,12 @@ const ALLOW_LIST: Readonly<Record<string, Readonly<Record<string, string>>>> = {
     // the rest of the buddy credential surface.
     CARTETHYIA_DEVICE_TOKEN_FILE: "buddy device-token file path, deployment-level injection",
   },
+  "src/providers/integrations/qoder/qoder-umid.ts": {
+    // Deployment-level bridge override: force/disable the mini-ELF UMID
+    // bundle on Linux (containers auto-detect). Read directly in the bridge
+    // because it decides which binary to spawn at mint time.
+    CARTETHYIA_QODER_UMID_MINI: "UMID bridge mode override (1=mini, 0=native, absent=auto)",
+  },
   "src/providers/integrations/buddy/turing-device-token.ts": {
     // TuringShield native SDK directory (turing_sdk.node + TuringShieldSDK.dll),
     // injected by the deployment — proprietary binary, not shipped in-repo.
@@ -98,6 +104,15 @@ const ALLOW_LIST: Readonly<Record<string, Readonly<Record<string, string>>>> = {
     // Cursor heartbeat tuning; subsystem-specific, only meaningful if the
     // operator is debugging the cursor transport.
     CARTETHYIA_CURSOR_HEARTBEAT_MS: "cursor transport heartbeat override",
+  },
+  "src/console/cli-tools/cartethyia-websearch-plugin.ts": {
+    // OpenCode websearch plugin generation: operator overrides for the
+    // generated plugin's gateway URL/key/backend. Only read at plugin-write
+    // time (CLI-tools apply), not by gateway request paths — they live next to
+    // the plugin generator so the generated file stays self-contained.
+    CARTETHYIA_SEARCH_URL: "opencode websearch plugin gateway URL override",
+    CARTETHYIA_SEARCH_API_KEY: "opencode websearch plugin API key override",
+    CARTETHYIA_SEARCH_BACKEND: "opencode websearch plugin backend override (exa/parallel)",
   },
 };
 

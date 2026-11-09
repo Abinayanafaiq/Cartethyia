@@ -65,6 +65,12 @@ export interface TelemetryEventInput {
    * list instead of needing the server's logs.
    */
   readonly payloadCaptureState?: string;
+  /**
+   * True for a completed request whose output was far smaller than the model's
+   * ceiling and which ended with an ordinary `stop` (a "degenerate stop").
+   * Carried onto the telemetry row so this pattern can be measured.
+   */
+  readonly degenerateStop?: boolean;
 }
 
 function tokenCountToInt(value: number | "unavailable" | undefined): number | undefined {
@@ -147,7 +153,8 @@ function telemetryEventRow(event: TelemetryEventInput) {
       event.usage?.estimated_cost === null || event.usage === undefined
         ? null
         : String(event.usage.estimated_cost),
-    // Buddy-meter credit; NULL when the upstream reported no credit field.
+    // Provider-billed credit (Tencent buddy-meter `credit`, Qoder `credits`);
+    // NULL when the upstream reported no credit field.
     // Numeric columns are string-typed in Drizzle, like `estimatedCostUsd`.
     creditUsed: event.usage?.credit_used != null ? String(event.usage.credit_used) : null,
     resolveMs: event.resolveMs ?? null,
@@ -155,6 +162,7 @@ function telemetryEventRow(event: TelemetryEventInput) {
     firstContentDeltaAtMs: event.firstContentDeltaAtMs ?? null,
     lastEventAtMs: event.lastEventAtMs ?? null,
     payloadCaptureState: event.payloadCaptureState ?? null,
+    degenerateStop: event.degenerateStop ?? null,
   };
 }
 

@@ -59,8 +59,8 @@ describe("mapGeminiUsage", () => {
   });
 
   test("keeps the inclusive prompt rather than adding cache again", () => {
-    // cached 30 of prompt 100: input the upstream billed is 100, and the fresh
-    // 70 is derived downstream — summing would read 130.
+    // cached 30 of prompt 100: input the upstream billed is 100, and the
+    // provider-reported split is preserved — summing would read 130.
     const record = normalizeUsage(
       usage({ promptTokenCount: 100, candidatesTokenCount: 10, cachedContentTokenCount: 30 }),
     );
@@ -71,7 +71,8 @@ describe("mapGeminiUsage", () => {
 
   test("survives Antigravity reporting cached above prompt", () => {
     // The observed quirk: a naive `prompt - cached` goes negative, and nothing
-    // may emit a negative token count downstream.
+    // may emit a negative token count downstream. The clamp caps cached at the
+    // prompt total.
     const record = normalizeUsage(
       usage({ promptTokenCount: 50, candidatesTokenCount: 10, cachedContentTokenCount: 80 }),
     );

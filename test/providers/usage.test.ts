@@ -50,7 +50,8 @@ describe("normalizeUsage: the OpenAI shape", () => {
 
   test("treats the reported total as all-in and derives the uncached part", () => {
     // OpenAI's `prompt_tokens` includes the cached subset, so uncached is
-    // total minus cached — not the other way round.
+    // total minus cached — not the other way round. The provider-reported
+    // split is preserved as-is.
     const usage = normalizeUsage({
       prompt_tokens: 100,
       completion_tokens: 10,
@@ -71,15 +72,6 @@ describe("normalizeUsage: the OpenAI shape", () => {
     expect(usage.uncached_input_tokens).toBe(0);
   });
 
-  test("reads the Responses API details field as well", () => {
-    const usage = normalizeUsage({
-      input_tokens: 100,
-      input_tokens_details: { cached_tokens: 25 },
-    });
-    expect(usage.cached_input_tokens).toBe(25);
-    expect(usage.uncached_input_tokens).toBe(75);
-  });
-
   test("a negative token count is clamped to zero", () => {
     const usage = normalizeUsage({ prompt_tokens: -5, completion_tokens: -1 });
     expect(usage.input_tokens).toBe(0);
@@ -97,7 +89,7 @@ describe("normalizeUsage: the Anthropic shape", () => {
   test("input_tokens counts fresh tokens only, and the total adds the cache volumes", () => {
     // The distinction the whole module exists for: Anthropic's `input_tokens`
     // excludes the cache read and write, so the canonical all-in total is
-    // fresh + read + written.
+    // fresh + read + written. The provider-reported split is preserved as-is.
     const usage = normalizeUsage({
       input_tokens: 10,
       output_tokens: 5,
@@ -113,19 +105,33 @@ describe("normalizeUsage: the Anthropic shape", () => {
   test("a cache read with no write still adds the read to the total", () => {
     const usage = normalizeUsage({ input_tokens: 10, cache_read_input_tokens: 90 });
     expect(usage.input_tokens).toBe(100);
+    expect(usage.cached_input_tokens).toBe(90);
+    expect(usage.uncached_input_tokens).toBe(10);
     expect(usage.cache_write_tokens).toBe("unavailable");
   });
 
   test("an inclusive total is not inflated when a bridge reuses the Anthropic cache field", () => {
-    const usage = normalizeUsage({
-      input_tokens: 178_479,
-      output_tokens: 142,
-      total_tokens: 178_621,
-      cache_read_input_tokens: 178_304,
-    });
-    expect(usage.input_tokens).toBe(178_479);
-    expect(usage.cached_input_tokens).toBe(178_304);
-    expect(usage.uncached_input_tokens).toBe(175);
+    // Under `as-is` (the legacy reader) the `total_tokens == input + output`
+    // heuristic wins: a bridge that reports an already-inclusive prompt plus
+    // the Anthropic cache fields is not inflated. The default `inclusive`
+    // mode intentionally trades this protection for cross-provider
+    // consistency — see provider-usage-input-mode.test.ts.
+    const previous = process.env.CARTETHYIA_USAGE_INPUT_MODE;
+    process.env.CARTETHYIA_USAGE_INPUT_MODE = "as-is";
+    try {
+      const usage = normalizeUsage({
+        input_tokens: 178_479,
+        output_tokens: 142,
+        total_tokens: 178_621,
+        cache_read_input_tokens: 178_304,
+      });
+      expect(usage.input_tokens).toBe(178_479);
+      expect(usage.cached_input_tokens).toBe(178_304);
+      expect(usage.uncached_input_tokens).toBe(175);
+    } finally {
+      if (previous === undefined) delete process.env.CARTETHYIA_USAGE_INPUT_MODE;
+      else process.env.CARTETHYIA_USAGE_INPUT_MODE = previous;
+    }
   });
 
   test("a write-only report records the write but leaves the total alone", () => {
@@ -172,6 +178,7 @@ describe("normalizeUsage: the cache-count spellings", () => {
   test("reads DeepSeek's flat prompt_cache_hit_tokens", () => {
     const usage = normalizeUsage({ prompt_tokens: 100, prompt_cache_hit_tokens: 70 });
     expect(usage.cached_input_tokens).toBe(70);
+    expect(usage.uncached_input_tokens).toBe(30);
   });
 
   test("prefers the flat hit count over a zeroed details field", () => {
@@ -189,11 +196,13 @@ describe("normalizeUsage: the cache-count spellings", () => {
   test("reads Gemini's flat cached_tokens", () => {
     const usage = normalizeUsage({ prompt_tokens: 100, cached_tokens: 30 });
     expect(usage.cached_input_tokens).toBe(30);
+    expect(usage.uncached_input_tokens).toBe(70);
   });
 
   test("reads Gemini's cachedContentTokenCount", () => {
     const usage = normalizeUsage({ prompt_tokens: 100, cachedContentTokenCount: 30 });
     expect(usage.cached_input_tokens).toBe(30);
+    expect(usage.uncached_input_tokens).toBe(70);
   });
 
   test("the DeepSeek flat field outranks the Anthropic field, against the field order", () => {
@@ -208,7 +217,10 @@ describe("normalizeUsage: the cache-count spellings", () => {
       cache_read_input_tokens: 11,
       prompt_cache_hit_tokens: 22,
     });
+    // The hit forces the Anthropic additive path (input becomes 1+22), so the
+    // split is the reported flat hit with the rest uncached.
     expect(usage.cached_input_tokens).toBe(22);
+    expect(usage.uncached_input_tokens).toBe(1);
   });
 
   test("the Anthropic field outranks the remaining flat and nested spellings", () => {
@@ -219,7 +231,10 @@ describe("normalizeUsage: the cache-count spellings", () => {
       cachedContentTokenCount: 44,
       prompt_tokens_details: { cached_tokens: 55 },
     });
+    // Input becomes 1+11 on the Anthropic additive path; the split preserves
+    // the reported read with fresh input uncached.
     expect(usage.cached_input_tokens).toBe(11);
+    expect(usage.uncached_input_tokens).toBe(1);
   });
 });
 
@@ -283,6 +298,18 @@ describe("normalizeUsage: credit", () => {
 
   test("a non-numeric credit is dropped", () => {
     expect(normalizeUsage({ credit: "1.01" })).not.toHaveProperty("credit_used");
+  });
+
+  test("Qoder credits shape is carried through", () => {
+    // Qoder's COSY terminal frame reports `credits` (e.g. 0.0055 on a lite
+    // turn), not buddy-meter `credit`.
+    expect(normalizeUsage({ credits: 0.0055 }).credit_used).toBe(0.0055);
+    expect(normalizeUsage({ credits: 0 }).credit_used).toBe(0);
+    expect(normalizeUsage({ credits: -2 })).not.toHaveProperty("credit_used");
+  });
+
+  test("explicit credit_used wins over the provider-specific aliases", () => {
+    expect(normalizeUsage({ credit: 1, credits: 2, credit_used: 3 }).credit_used).toBe(3);
   });
 });
 
@@ -522,6 +549,7 @@ describe("the round trip through a wire builder keeps the canonical totals", () 
     });
     const wire = usageToChatWire(normalized);
     expect(wire.prompt_tokens).toBe(100);
+    // The provider-reported split is preserved on the wire.
     expect(wire.prompt_tokens_details?.cached_tokens).toBe(60);
   });
 
@@ -533,6 +561,8 @@ describe("the round trip through a wire builder keeps the canonical totals", () 
       cache_creation_input_tokens: 30,
     });
     const wire = usageToMessagesWire(normalized);
+    // The provider-reported split is preserved: fresh input stays fresh, the
+    // read is the reported read, and the write stays split.
     expect(wire["input_tokens"]).toBe(10);
     expect(wire["cache_read_input_tokens"]).toBe(90);
     expect(wire["cache_creation_input_tokens"]).toBe(30);

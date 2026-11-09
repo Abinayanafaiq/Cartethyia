@@ -26,11 +26,13 @@ import {
   accountIdentity,
   displayAccountHint,
   formatQuotaRefresh,
+  formatQuotaPlanLabel,
   formatQuotaWindowLabel,
   formatResetDistance,
   friendlyQuotaError,
   paginateQuotaWindows,
   quotaBarTone,
+  quotaPillSummary,
   QUOTA_WINDOWS_PER_PAGE,
 } from "../../src/lib/format/quota";
 
@@ -141,6 +143,22 @@ describe("formatResetDistance", () => {
     const value = formatResetDistance(fromNow(2 * HOUR + 2 * MINUTE));
     expect(value).toBe("Resets in 2h 2mins");
     expect(value).not.toContain("minute");
+  });
+});
+
+describe("Start Plan presentation", () => {
+  test("summarizes plans without hiding unknown grant identity or changing other providers", () => {
+    expect(formatQuotaPlanLabel("ZCODE GLOBAL BUILD, ZCode Start Plan", "zcode-start")).toBe("Start +1");
+    expect(formatQuotaPlanLabel("Custom Promo, Other Grant", "zcode-start")).toBe("Custom Promo +1");
+    expect(formatQuotaPlanLabel("ZCODE GLOBAL BUILD", "zcode-start")).toBe("Global Build");
+    expect(formatQuotaPlanLabel("Go, Team", "commandcode")).toBe("Go, Team");
+  });
+
+  test("removes matching model prefixes and preserves unknown grants", () => {
+    expect(formatQuotaWindowLabel("GLM-5.3-Flash · ZCODE GLOBAL BUILD · one-time", "zcode-start", ["glm-5.3-flash"])).toBe("Global Build · One-time");
+    expect(formatQuotaWindowLabel("GLM-5.3-Trial · ZCode Start Plan · daily", "zcode-start", ["glm-5.3"])).toBe("Start · Daily");
+    expect(formatQuotaWindowLabel("GLM-5.3 · Custom PROMO · daily", "zcode-start", ["glm-5.3-flash"])).toBe("GLM-5.3 · Custom PROMO · Daily");
+    expect(formatQuotaWindowLabel("GLM-5.3 · Custom PROMO · daily", "commandcode", ["glm-5.3"])).toBe("GLM-5.3 · Custom PROMO · daily");
   });
 });
 
@@ -691,5 +709,73 @@ describe("accountIdentity", () => {
       primary: "me@example.com",
       secondary: "Unnamed account",
     });
+  });
+});
+
+describe("quotaPillSummary grant and credit balances", () => {
+  test("uncapped purchased/free credits add to monthly credits without inventing a ceiling", () => {
+    const summary = quotaPillSummary([
+      { accounting: "pooled", remainingPercent: 20, remaining: 20, used: 80, limit: 100 },
+      { accounting: "pooled", remainingPercent: null, remaining: 150, limit: null },
+    ]);
+    expect(summary.remaining).toBe(170);
+    expect(summary.hasCredits).toBe(true);
+    expect(summary.text).toBe("170 left");
+    expect(summary.low).toBe(false);
+  });
+
+  test("future balances never fund a pill or hide live quota", () => {
+    const startsAt = fromNow(DAY);
+    const future = [
+      { accounting: "pooled" as const, remainingPercent: 100, remaining: 100, limit: 100, startsAt },
+      { accounting: "independent" as const, remainingPercent: 100, startsAt },
+    ];
+    expect(quotaPillSummary(future).text).toBeNull();
+    expect(quotaPillSummary([
+      ...future,
+      { accounting: "independent", remainingPercent: 30 },
+    ]).text).toBe("30% left");
+  });
+});
+
+describe("model-scoped quota availability", () => {
+  test("same-model grants are alternatives and unrelated spent models do not exhaust the account", () => {
+    const grant = { accounting: "independent" as const, remainingPercent: 0, modelIds: ["glm-5.3"] };
+    const summary = quotaPillSummary([grant, { ...grant, remainingPercent: 50 }, { ...grant, modelIds: ["glm-5.3-flash"] }]);
+    expect(summary.text).toBe("1 of 2 models available");
+    expect(summary.low).toBe(false);
+    expect(summary.available).toBe(true);
+    expect(summary.empty).toBe(false);
+    expect(summary.lowestPercent).toBeNull();
+  });
+
+  test("account-wide independent windows still constrain every model", () => {
+    const summary = quotaPillSummary([
+      { accounting: "independent", remainingPercent: 50, modelIds: ["glm-5.3"] },
+      { accounting: "independent", remainingPercent: 0 },
+    ]);
+    expect(summary.text).toBe("0 of 1 models available · 0% account limit left");
+    expect(summary.low).toBe(true);
+    expect(summary.available).toBe(false);
+    expect(summary.empty).toBe(true);
+  });
+
+  test("start and expiry boundaries agree with summaries without expiring recurring account limits", () => {
+    const originalNow = Date.now;
+    const now = Date.parse("2026-11-02T12:00:00Z");
+    Date.now = () => now;
+    try {
+      const grant = { accounting: "independent" as const, remainingPercent: 50, remaining: 50, modelIds: ["glm-5.3"] };
+      expect(quotaPillSummary([{ ...grant, startsAt: new Date(now).toISOString() }]).available).toBe(true);
+      const future = { ...grant, startsAt: new Date(now + 1).toISOString() };
+      expect(quotaPillSummary([future]).available).toBe(false);
+      expect(quotaPillSummary([future]).empty).toBe(false);
+      expect(quotaPillSummary([{ ...grant, remainingPercent: 0 }, future]).empty).toBe(true);
+      const expired = { ...grant, resetsAt: new Date(now).toISOString(), recurring: true };
+      expect(quotaPillSummary([expired]).available).toBe(false);
+      expect(quotaPillSummary([expired]).empty).toBe(true);
+      expect(quotaPillSummary([expired]).text).toBe("0 of 1 models available");
+      expect(quotaPillSummary([{ ...expired, modelIds: [] }]).available).toBe(true);
+    } finally { Date.now = originalNow; }
   });
 });

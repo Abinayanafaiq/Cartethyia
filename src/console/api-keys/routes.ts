@@ -41,7 +41,6 @@ import {
 } from "./contracts";
 import type { SharedKeyActivityDetail, SharedKeySummary } from "../share/share-usage";
 import { popupImageBytes } from "./share-popup-image";
-import { log } from "../../observability/logger";
 
 const SHARED_CHILD_SORT_COLUMNS = new Set<SharedChildSortColumn>([
   "createdAt",
@@ -81,39 +80,35 @@ function parseSharedChildrenQuery(query: URLSearchParams): SharedChildrenPageOpt
 
 export function createApiKeyOperations(config: ApiKeyConfig) {
   const operations = {
-    async listKeys(access: AccessDecision | undefined): Promise<ApiKeyResponse[]> {
+    async listKeys(access: AccessDecision | undefined, includeChildren = false): Promise<ApiKeyResponse[]> {
         const authorized = requireTenantScope(access, "dashboard:read");
         const records = await config.store.list(authorized.tenantId);
         const topLevel = records.filter(
           (record) => record.revokedAt === undefined && record.parentKeyId === undefined,
         );
-        // A share template's own counter never moves for child traffic, so
-        // reporting it raw would show a template as untouched while the gateway
-        // is refusing its recipients on the parent budget. Report the figure
-        // the gateway actually enforces: the template's counter plus every
-        // telemetry total the family ever recorded — revoked/deleted children
-        // included (their spend is already spent), so the number survives
-        // cleanup and matches the share page.
+        // Share children are omitted from the main key list (they belong to a
+        // template), but the Banned Users search wants them so a child can be
+        // found and banned by hand.
+        const visible = includeChildren
+          ? records.filter((record) => record.revokedAt === undefined)
+          : topLevel;
+        // A share template's own counter is the live family accumulator now:
+        // every recipient commit adds to it (see ApiKeyAdmissionService
+        // commitUsage), so reporting it raw gives the enforced family total.
+        // No telemetry add-on is needed, and adding it here would double-count.
         return Promise.all(
-          topLevel.map(async (record) => {
+          visible.map(async (record) => {
             const response = sanitizeApiKeyResponse(record);
             if (record.keyMode !== "share") return response;
-            const family = await config.store
-              .sumFamilyTelemetryConsumed(authorized.tenantId, record.id)
-              .catch((error) => {
-                // A failed sum must not fail the whole list, but it must not
-                // be silent either: reporting the share template's spend as 0
-                // under-reports consumed tokens in the console list.
-                log.warn(
-                  `[api-keys] sumFamilyTelemetryConsumed failed for key ${record.id}; reporting 0`,
-                  error as Error,
-                );
-                return 0;
-              });
-            return { ...response, tokensConsumed: response.tokensConsumed + family };
+            return response;
           }),
-        );
-      },
+      );
+    },
+    async listActiveBannedKeys(access: AccessDecision | undefined): Promise<ApiKeyResponse[]> {
+      const authorized = requireTenantScope(access, "dashboard:read");
+      const records = await config.store.listActiveBanned(authorized.tenantId);
+      return records.map(sanitizeApiKeyResponse);
+    },
     /** Persists a new credential order. `keyIds` must name every top-level key
         the tenant has, so a partial list cannot silently renumber rows. */
     async reorderKeys(access: AccessDecision | undefined, keyIds: readonly string[]): Promise<void> {
@@ -932,9 +927,17 @@ function jsonNull(): Response {
 export function createApiKeyRoutes(config: ApiKeyConfig): AnyElysia {
   const factory = createApiKeyOperations(config);
   return new Elysia({ prefix: "/api-keys" })
-    .get("/", async ({ request, set }) => {
+    .get("/", async ({ request, set, query }) => {
       try {
-        return await factory.listKeys(config.accessResolver(request));
+        const includeChildren = query?.["includeChildren"] === "1" || query?.["includeChildren"] === "true";
+        return await factory.listKeys(config.accessResolver(request), includeChildren);
+      } catch (error) {
+        return errorResponse(error, set, "API-key operation failed");
+      }
+    })
+    .get("/banned", async ({ request, set }) => {
+      try {
+        return await factory.listActiveBannedKeys(config.accessResolver(request));
       } catch (error) {
         return errorResponse(error, set, "API-key operation failed");
       }

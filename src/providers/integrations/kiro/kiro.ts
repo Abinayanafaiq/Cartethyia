@@ -281,7 +281,8 @@ function kiroUsage(
     ...(usage.credits === undefined ? {} : { credit_used: usage.credits }),
   };
   // The runtime never reports cache hits; close the gap with our own history.
-  // A genuine ( >0) report conserves the complete record.
+  // A genuine ( >0) report conserves the complete record. Then the operator's
+  // cache mode decides whether a hit makes the whole input count as cached.
   return estimateKiroSessionCache(record, sessionId, messages);
 }
 

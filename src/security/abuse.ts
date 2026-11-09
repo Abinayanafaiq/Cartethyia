@@ -113,6 +113,15 @@ export interface IpAbuseStore {
    * bounded `admission_unavailable` with zero dispatches.
    */
   checkAndRecord(attempt: IpAbuseAttempt): Promise<IpAbuseOutcome>;
+  /**
+   * Manually bans an identity for `durationMs` (0/negative = permanent).
+   * Throws when the store is unreachable.
+   */
+  ban(identity: string, durationMs: number): Promise<void>;
+  /** Lifts a manual (or any) ban on an identity. No-op when not banned. */
+  unban(identity: string): Promise<void>;
+  /** Lists currently active bans with their expiry (`null` = permanent). */
+  listBans(): Promise<readonly { identity: string; bannedUntil: number | null }[]>;
 }
 
 interface IpAbuseProtectionServiceOptions {
@@ -201,7 +210,7 @@ export class InMemoryIpAbuseStore implements IpAbuseStore {
       typeof windowOrOptions === "number" ? { windowMs: windowOrOptions } : windowOrOptions;
     this.windowMs = options.windowMs ?? 60_000;
     this.clock = options.clock ?? (() => Date.now());
-    // 10k keys is a few MB even at the default 240 RPM ring size; the previous
+    // 10k keys is a few MB even at the default 540 RPM ring size; the previous
     // 100k bound could reach ~190 MB, and a fan-out over unique source IPs is
     // the one input that can actually reach it.
     this.maxKeys = options.maxKeys ?? 10_000;
@@ -293,6 +302,34 @@ export class InMemoryIpAbuseStore implements IpAbuseStore {
     return true;
   }
 
+  async ban(identity: string, durationMs: number): Promise<void> {
+    this.assertAvailable();
+    this.evictOldest(this.bans);
+    this.bans.set(identity, durationMs > 0 ? this.clock() + durationMs : Number.POSITIVE_INFINITY);
+  }
+
+  async unban(identity: string): Promise<void> {
+    this.assertAvailable();
+    this.bans.delete(identity);
+  }
+
+  async listBans(): Promise<readonly { identity: string; bannedUntil: number | null }[]> {
+    this.assertAvailable();
+    const now = this.clock();
+    const out: { identity: string; bannedUntil: number | null }[] = [];
+    for (const [identity, until] of this.bans) {
+      if (until <= now) {
+        this.bans.delete(identity);
+        continue;
+      }
+      out.push({
+        identity,
+        bannedUntil: Number.isFinite(until) ? until : null,
+      });
+    }
+    return out;
+  }
+
   async checkAndRecord(attempt: IpAbuseAttempt): Promise<IpAbuseOutcome> {
     this.assertAvailable();
     const { identity, route, now, limit, banThreshold, banDurationMs } = attempt;
@@ -382,14 +419,14 @@ export class IpAbuseProtectionService {
   ) {
     if (!store)
       throw new Error("IpAbuseProtectionService requires a store — fail-closed, not no-op");
-    // 240 requests per 60 s window = 4 RPS/IP steady-state cap. Aligns
-    // with the documented default: unset env → 240 RPM per IP, not
+    // 540 requests per 60 s window = 9 RPS/IP steady-state cap. Aligns
+    // with the documented default: unset env → 540 RPM per IP, not
     // unlimited. Operators raise or lower via IP_RATE_MAX_PER_WINDOW.
-    this.maxRequestsPerWindow = opts.maxRequestsPerWindow ?? 240;
+    this.maxRequestsPerWindow = opts.maxRequestsPerWindow ?? 540;
     // A ban only makes sense once the limit was breached, so the threshold is
     // clamped above the cap: below it, escalation would be unreachable (the
     // count can never exceed `maxRequestsPerWindow` without being rejected).
-    this.banThreshold = Math.max(opts.banThreshold ?? 480, this.maxRequestsPerWindow + 1);
+    this.banThreshold = Math.max(opts.banThreshold ?? 1080, this.maxRequestsPerWindow + 1);
     this.banDurationMs = opts.banDurationMs ?? 60 * 60 * 1000;
   }
 
@@ -581,6 +618,40 @@ export class RedisIpAbuseStore implements IpAbuseStore {
       `${now}:${crypto.randomUUID()}`,
     );
     return decodeAbuseOutcome(raw);
+  }
+
+  async ban(identity: string, durationMs: number): Promise<void> {
+    const marker = this.banMarkerKey(identity);
+    const now = Date.now();
+    if (durationMs > 0) {
+      await this.redis.set(marker, String(now + durationMs), "PX", durationMs);
+    } else {
+      // Permanent: no TTL; a large sentinel far in the future.
+      await this.redis.set(marker, String(Number.MAX_SAFE_INTEGER));
+    }
+  }
+
+  async unban(identity: string): Promise<void> {
+    await this.redis.del(this.banMarkerKey(identity));
+  }
+
+  async listBans(): Promise<readonly { identity: string; bannedUntil: number | null }[]> {
+    const keys = await this.redis.keys("cartethyia:ip:ban:*");
+    const now = Date.now();
+    const out: { identity: string; bannedUntil: number | null }[] = [];
+    for (const key of keys) {
+      const value = await this.redis.get(key);
+      const until = Number(value ?? 0);
+      if (!Number.isFinite(until) || until <= now) {
+        await this.redis.del(key);
+        continue;
+      }
+      out.push({
+        identity: key.slice("cartethyia:ip:ban:".length),
+        bannedUntil: until >= Number.MAX_SAFE_INTEGER - 1 ? null : until,
+      });
+    }
+    return out;
   }
 }
 

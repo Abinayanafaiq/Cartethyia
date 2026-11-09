@@ -126,7 +126,13 @@ export const QODER_CN_MODEL_CONFIGS: Readonly<Record<string, QoderModelConfig>> 
  * `qmodel` carries a 1M window. That is why the rosters are not merged.
  */
 export const QODER_INTL_MODEL_CONFIGS: Readonly<Record<string, QoderModelConfig>> = {
-  auto: { id: "auto", display_name: "Auto", max_input_tokens: 200000, max_output_tokens: 64_000, is_vl: true, is_reasoning: false },
+  // Every row declares its *maximum selectable* window (1M), not the currently
+  // active one: Qoder publishes a `context_config` of selectable windows per
+  // row (1M/400K/200K/…), and the adapter dispatches the widest
+  // (`qoderMaxContextFor`). The live list's `max_input_tokens` only names the
+  // currently-selected window (often 180K/200K), which is not a ceiling —
+  // declaring that would cap a conversation a 1M-capable account could run.
+  auto: { id: "auto", display_name: "Auto", max_input_tokens: 1000000, max_output_tokens: 64_000, is_vl: true, is_reasoning: false },
   ultimate: { id: "ultimate", display_name: "Ultimate", max_input_tokens: 1000000, max_output_tokens: 128_000, is_vl: true, is_free: false, is_reasoning: true },
   // `fast` is what the live roster reports today; `performance` is the older
   // key for the same slot. Both are kept so a hand-added model id written
@@ -134,14 +140,18 @@ export const QODER_INTL_MODEL_CONFIGS: Readonly<Record<string, QoderModelConfig>
   // discovery supersedes it on the first successful fetch.
   fast: { id: "fast", display_name: "Fast", max_input_tokens: 1000000, max_output_tokens: 64_000, is_vl: true, is_reasoning: false },
   performance: { id: "performance", display_name: "Performance", max_input_tokens: 1000000, max_output_tokens: 64_000, is_vl: true, is_reasoning: false },
-  efficient: { id: "efficient", display_name: "Efficient", max_input_tokens: 200000, max_output_tokens: 64_000, is_vl: true, is_reasoning: false },
+  efficient: { id: "efficient", display_name: "Efficient", max_input_tokens: 1000000, max_output_tokens: 64_000, is_vl: true, is_reasoning: false },
   // Sonus/Cantus need an explicit effort on the IDE surface; without it the
   // upstream streams text only, no reasoning (verified live). DeepSeek-family
   // models think by default and are left untouched.
   smodel: { id: "smodel", display_name: "Sonus", max_input_tokens: 1000000, max_output_tokens: 128_000, is_vl: true, is_free: false, is_reasoning: true, default_reasoning_effort: "high" },
   cmodel: { id: "cmodel", display_name: "Cantus", max_input_tokens: 1000000, max_output_tokens: 128_000, is_vl: true, is_free: false, is_reasoning: true, default_reasoning_effort: "high" },
   qmodel_38max: { id: "qmodel_38max", display_name: "Qwen3.8-Max", max_input_tokens: 1000000, max_output_tokens: 131_072, is_vl: true, is_reasoning: true },
-  qfmodel: { id: "qfmodel", display_name: "Qwen3.8-Flash", max_input_tokens: 1000000, max_output_tokens: 131_072, is_vl: true, is_free: true, is_reasoning: true },
+  // `qfmodel` is billed, not free: upstream's live `is_free: true` for this
+  // slot is a plan-tier flag, not a zero-cost tier — a free account gets
+  // `quota exceeded` (116) when dispatching it. The only truly free slot is
+  // `lite`. Do not re-add `is_free` here.
+  qfmodel: { id: "qfmodel", display_name: "Qwen3.8-Flash", max_input_tokens: 1000000, max_output_tokens: 131_072, is_vl: true, is_reasoning: true },
   qmodel_latest: { id: "qmodel_latest", display_name: "Qwen3.7-Max", max_input_tokens: 1000000, max_output_tokens: 131_072, is_vl: true, is_reasoning: false },
   qmodel: { id: "qmodel", display_name: "Qwen3.7-Plus", max_input_tokens: 1000000, max_output_tokens: 131_072, is_vl: true, is_reasoning: false },
   kmodel_latest: { id: "kmodel_latest", display_name: "Kimi-K3.1-Pro", max_input_tokens: 1000000, max_output_tokens: 131_072, is_vl: true, is_free: false, is_reasoning: false },
@@ -152,7 +162,7 @@ export const QODER_INTL_MODEL_CONFIGS: Readonly<Record<string, QoderModelConfig>
   // Live roster (2026-11-01) reports dfmodel as billed (is_free false); it was
   // previously marked free. Display names are corrected from the same capture.
   dfmodel: { id: "dfmodel", display_name: "DeepSeek-Flash", max_input_tokens: 1000000, max_output_tokens: 384_000, is_vl: true, is_free: false, is_reasoning: true },
-  mmodel: { id: "mmodel", display_name: "MiniMax-M3.1-Flash", max_input_tokens: 1000000, max_output_tokens: 512_000, is_vl: true, is_free: false, is_reasoning: false },
+  mmodel: { id: "mmodel", display_name: "MiniMax-M3.1-Flash", max_input_tokens: 1000000, max_output_tokens: 512_000, is_vl: true, is_free: false, is_reasoning: true },
   // `lite` is the free-tier plan package: same 1M window and multimodal input
   // as `qmodel` (Qwen3.7-Plus), capped at 64k output, free tier.
   lite: { id: "lite", display_name: "Lite-Qwen-3.7-Plus", max_input_tokens: 1000000, max_output_tokens: 65_536, is_vl: true, is_free: true, is_reasoning: false },

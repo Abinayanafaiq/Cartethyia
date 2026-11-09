@@ -1,4 +1,5 @@
 import type { UsageRecord } from "../protocol/canonical-model";
+import { resolveUsageInputMode } from "../config/usage";
 export interface OpenAiUsage {
   prompt_tokens: number;
   completion_tokens: number;
@@ -235,10 +236,21 @@ export function normalizeUsage(input: Record<string, unknown>): UsageRecord {
   const reportedTotal = typeof input.total_tokens === "number" ? input.total_tokens : null;
   const inputAlreadyIncludesCache =
     reportedTotal !== null && reportedTotal === input_tokens + output_tokens;
-  const hasAnthropicCacheShape = anthropic_cache_read !== null && !inputAlreadyIncludesCache;
+  // `inclusive` (default) folds cache into input so every provider reads alike:
+  // IN is always the whole prompt and CACHED its subset. Anthropic's raw shape
+  // is fresh-only with cache separate — and its `total_tokens` equals
+  // input+output by contract, so the `inputAlreadyIncludesCache` heuristic
+  // would otherwise mistake it for already-inclusive and never add the cache,
+  // under-reporting prompt by the entire cached span. `as-is` keeps the raw
+  // upstream semantics (and the legacy heuristic for already-inclusive bridges).
+  const accountInputInclusive = resolveUsageInputMode() === "inclusive";
+  const cacheIsSeparate = anthropic_cache_read !== null;
+  const shouldFoldCache = accountInputInclusive
+    ? cacheIsSeparate
+    : cacheIsSeparate && !inputAlreadyIncludesCache;
   let uncached_input_tokens: number | "unavailable" = "unavailable";
   if (typeof cached_input_tokens === "number") {
-    if (hasAnthropicCacheShape) {
+    if (shouldFoldCache) {
       uncached_input_tokens = input_tokens;
       input_tokens +=
         cached_input_tokens + (typeof cache_write_tokens === "number" ? cache_write_tokens : 0);
@@ -246,7 +258,7 @@ export function normalizeUsage(input: Record<string, unknown>): UsageRecord {
       uncached_input_tokens = Math.max(0, input_tokens - Math.min(input_tokens, cached_input_tokens));
       cached_input_tokens = Math.min(input_tokens, cached_input_tokens);
     }
-  } else if (hasAnthropicCacheShape && typeof cache_write_tokens === "number") {
+  } else if (shouldFoldCache && typeof cache_write_tokens === "number") {
     input_tokens += cache_write_tokens;
   }
 
@@ -287,6 +299,14 @@ export function normalizeUsage(input: Record<string, unknown>): UsageRecord {
     },
     rawCost,
   ) ?? null;
+  // Provider-billed credits: an explicit `credit_used` wins, then Qoder's
+  // `credits` (COSY terminal frame), then Tencent buddy-meter `credit`.
+  // Negative/NaN values are dropped, never clamped.
+  const creditRaw = input.credit_used ?? input.credits ?? input.credit;
+  const creditUsed =
+    typeof creditRaw === "number" && Number.isFinite(creditRaw) && creditRaw >= 0
+      ? { credit_used: creditRaw }
+      : {};
   return {
     input_tokens,
     cached_input_tokens,
@@ -295,12 +315,7 @@ export function normalizeUsage(input: Record<string, unknown>): UsageRecord {
     output_tokens,
     reasoning_tokens,
     estimated_cost,
-    // Tencent buddy-meter credit: top-level `credit` in the Chat usage frame
-    // (probed live on cb/deepseek-v4.1-flash-sg: 0 on a 29-token turn, 1.01
-    // on a 72k-token turn). Negative/NaN values are dropped, never clamped.
-    ...(typeof input.credit === "number" && Number.isFinite(input.credit) && input.credit >= 0
-      ? { credit_used: input.credit }
-      : {}),
+    ...creditUsed,
     ...(Object.keys(details).length > 0 ? { details } : {}),
   };
 }
