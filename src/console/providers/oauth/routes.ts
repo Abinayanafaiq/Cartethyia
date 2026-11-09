@@ -7,7 +7,6 @@ import type { OAuthDevicePollResponse } from "../catalog/contracts";
 import { providerJwtVerification } from "../../../providers/provider-metadata";
 import type { ProviderRegistry } from "../../../providers/provider-registry";
 import { browserAuthorizeRedirectUri } from "../../../config/providers";
-import { KiroOidcPendingError } from "../../../providers/integrations/kiro/kiro-oauth";
 import { log } from "../../../observability/logger";
 import { GatewayError } from "../../../protocol/gateway-error";
 import { Elysia, t, type AnyElysia } from "elysia";
@@ -172,7 +171,7 @@ export class DrizzleOAuthAccountStore implements OAuthAccountStore {
  * server the redirect arrives at; `callback-listener.ts` is what makes those
  * the same endpoint.
  */
-export interface PersistedOAuthAccount {
+interface PersistedOAuthAccount {
   readonly accountId: string;
 }
 
@@ -213,7 +212,7 @@ async function requireClient(
 }
 
 /** The result of exchanging one authorization code, as the caller should report it. */
-export interface OAuthCompleteOutcome {
+interface OAuthCompleteOutcome {
   readonly ok: boolean;
   readonly message: string;
   /**
@@ -308,6 +307,13 @@ export async function completeLogin(
     // authorize URL plus a fresh PKCE verifier and the OIDC registration.
     // Rewrite the pending flow so phase 2 exchanges against that verifier, keep
     // the listener alive, and tell the caller to redirect the browser there.
+    // dynamic-import: B-02 lazy graph — 58KB kiro OIDC path, only for Kiro flows.
+    // The kiro-oauth graph is 58KB, so it is imported lazily here — only the
+    // Kiro OIDC path needs the error class — instead of on the console boot
+    // graph (B-02).
+    const { KiroOidcPendingError } = await import(
+      "../../../providers/integrations/kiro/kiro-oauth"
+    );
     if (error instanceof KiroOidcPendingError) {
       // Phase 1 of Kiro's OIDC portal login: the portal callback carried no
       // code — only `login_option` + issuer/region. The client answered with the
@@ -410,7 +416,7 @@ function failurePage(message: string, wantsJson: boolean): Response {
   );
 }
 
-export function createOAuthLoginOperations(config: OAuthLoginConfig) {
+function createOAuthLoginOperations(config: OAuthLoginConfig) {
   const operations = {
     async beginAuthorize(
         access: AccessDecision | undefined,

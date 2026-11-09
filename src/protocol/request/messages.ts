@@ -2,6 +2,7 @@
  * Canonical → Claude Messages request builder.
  */
 import { allParts, type CanonicalRequest, type ContentPart } from "../canonical-model";
+import type { DialectPolicy } from "../translation/dialect/types";
 import { buildAnthropicThinkingPayload } from "../../protocol/reasoning";
 import { anthropicCacheControl } from "../../protocol/translation/cache-controls";
 import {
@@ -28,14 +29,17 @@ import {
 } from "../codecs";
 import { log } from "../../observability/logger";
 import { base64DecodedByteLength, clampImage } from "../image-clamp";
-import { clampReasoningEffort, claudeUsesAdaptiveThinking, LEVEL_TO_BUDGET, resolveSupportedReasoningEfforts } from "../../protocol/translation/thinking";
+import { LEVEL_TO_BUDGET } from "../../protocol/translation/thinking";
+import type { ThinkingConfig } from "../../protocol/translation/dialect/thinking-ladder";
+import { clampThinkingLevelForModel } from "../../protocol/translation/dialect/model-thinking";
+import { resolveThinkingForModel } from "../../protocol/translation/dialect/thinking-ladder";
 import { claudeResponseToEvents, parseClaudeSseStream } from "../response/messages";
 
 /**
  * Gateway default when the caller sent no max_tokens (Anthropic requires
  * the field). Explicit and warned at the call site — never silent.
  */
-export const ANTHROPIC_DEFAULT_MAX_TOKENS = WIRE_TOKEN_BOUNDS["messages"]?.defaultMaxTokens ?? 4_096;
+const ANTHROPIC_DEFAULT_MAX_TOKENS = WIRE_TOKEN_BOUNDS["messages"]?.defaultMaxTokens ?? 4_096;
 
 /** Anthropic Messages' documented base64-image media-type allowlist. */
 const ANTHROPIC_IMAGE_MEDIA_TYPES = new Set([
@@ -556,7 +560,13 @@ export function claudeFallbacksChain(
 
 export function canonicalToClaudeMessagesPayload(
   request: CanonicalRequest,
-  options: { isOAuth?: boolean; maxBytesOverride?: number } = {},
+  options: {
+    isOAuth?: boolean;
+    maxBytesOverride?: number;
+    dialectPolicy?: DialectPolicy;
+    thinking?: ThinkingConfig;
+    maxOutputTokens?: number;
+  } = {},
 ): ClaudeWireObject {
   const seen = new Map<string, number>();
   const idMap = new Map<string, string>();
@@ -653,7 +663,11 @@ export function canonicalToClaudeMessagesPayload(
   const normalizedControls = normalizeWireMaxTokens(request.generation_controls);
   const requestedMax = normalizedControls.max_tokens;
   const hasTools = (request.tools?.length ?? 0) > 0;
-  let maxTokens = resolveWireMaxTokens("messages", { max_tokens: requestedMax }, { hasTools, isOAuth }) ?? ANTHROPIC_DEFAULT_MAX_TOKENS;
+  let maxTokens = resolveWireMaxTokens("messages", { max_tokens: requestedMax }, {
+    hasTools,
+    isOAuth,
+    ...(options.maxOutputTokens === undefined ? {} : { maxOutputTokens: options.maxOutputTokens }),
+  }) ?? ANTHROPIC_DEFAULT_MAX_TOKENS;
   if (requestedMax === undefined) {
     log.warn("claude: max_tokens absent, defaulting", {
       max_tokens: maxTokens,
@@ -665,21 +679,32 @@ export function canonicalToClaudeMessagesPayload(
     });
   }
   const thinkingEnabled = isThinkingEnabled(request);
+  // Real ceilings (P2-12): an impossible thinking budget surfaces as a typed
+  // local 400 instead of an over-ceiling max_tokens that 400s opaquely upstream.
+  // Non-OAuth caps at the model's catalog output limit (when known) so the
+  // thinking guard can fire instead of shipping an over-catalog-limit
+  // `max_tokens`; OAuth keeps its own ceiling per the table.
+  const maxAllowed = isOAuth
+    ? WIRE_TOKEN_BOUNDS["messages"]?.oauthCeiling ?? Number.MAX_SAFE_INTEGER
+    : options.maxOutputTokens ?? Number.MAX_SAFE_INTEGER;
   if (thinkingEnabled && request.reasoning?.budget_tokens !== undefined) {
     maxTokens = ensureMaxTokensForThinking(
       maxTokens,
       request.reasoning.budget_tokens,
-      Number.MAX_SAFE_INTEGER,
+      maxAllowed,
     );
   }
   // Whether this model speaks adaptive thinking (`type: "adaptive"` +
   // `output_config.effort`) or budget thinking (`type: "enabled"` +
   // `budget_tokens`). The two generations reject each other's shape, so the
-  // choice is made from the model id, not from the caller's canonical intent —
-  // a chat/responses caller states only an effort, and a budget-era model
-  // answers the adaptive shape with "adaptive thinking is not supported on this
-  // model" (verified live: opus-4-5/sonnet-4-5/haiku-4-5).
-  const adaptiveThinking = claudeUsesAdaptiveThinking(request.model);
+  // choice is made from the resolved thinking config, not from the caller's
+  // canonical intent — a chat/responses caller states only an effort, and a
+  // budget-era model answers the adaptive shape with "adaptive thinking is not
+  // supported on this model" (verified live: opus-4-5/sonnet-4-5/haiku-4-5).
+  // When no config is supplied (direct-route callers), fall back to resolving
+  // it from the model/wire — the resolved `mode` IS the generation answer.
+  const resolvedThinking = options.thinking ?? resolveThinkingForModel(request.model, "", "messages");
+  const adaptiveThinking = resolvedThinking.mode === "anthropic-adaptive";
   let effectiveBudgetTokens = request.reasoning?.budget_tokens;
   // Derive a budget from the level whenever a budget-era model is asked to
   // reason by effort alone. The gate is NOT `isThinkingEnabled`: a chat/responses
@@ -699,7 +724,13 @@ export function canonicalToClaudeMessagesPayload(
   if (!adaptiveThinking && effectiveBudgetTokens !== undefined) {
     // The upstream requires the budget to stay below `max_tokens`; raise
     // max_tokens to leave room for the answer rather than let it 400.
-    maxTokens = ensureMaxTokensForThinking(maxTokens, effectiveBudgetTokens, Number.MAX_SAFE_INTEGER);
+    maxTokens = ensureMaxTokensForThinking(maxTokens, effectiveBudgetTokens, maxAllowed);
+  }
+  // Final clamp to the model's catalog output limit: thinking may have raised
+  // `max_tokens` (e.g. under an OAuth ceiling wider than the catalog limit), so
+  // the value that ships must never exceed what the model can actually emit.
+  if (options.maxOutputTokens !== undefined && maxTokens > options.maxOutputTokens) {
+    maxTokens = options.maxOutputTokens;
   }
   const payload: ClaudeWireObject = {
     model: request.model,
@@ -748,7 +779,8 @@ export function canonicalToClaudeMessagesPayload(
   }
   const parallelToolCallsDisabled =
     request.generation_controls.parallel_tool_calls === false;
-  if (rawToolChoice !== undefined || parallelToolCallsDisabled) {
+  const supportsToolChoice = options.dialectPolicy?.supportsToolChoice ?? true;
+  if (supportsToolChoice && (rawToolChoice !== undefined || parallelToolCallsDisabled)) {
     const baseChoice = rawToolChoice as Record<string, unknown> | undefined;
     const choice: Record<string, unknown> = baseChoice
       ? { ...baseChoice }
@@ -835,9 +867,9 @@ export function canonicalToClaudeMessagesPayload(
     // is NOT a wire field — display rides on `thinking.display` above.
     // Clamp to the model's published ladder exactly like the chat/Responses
     // codecs: an out-of-ladder tier is an upstream 4xx.
-    const effort = clampReasoningEffort(
+    const effort = clampThinkingLevelForModel(
+      resolvedThinking,
       request.reasoning.effort,
-      resolveSupportedReasoningEfforts(request.model, "messages"),
     );
     const taskBudget = request.reasoning.task_budget;
     // `output_config.effort` rides every generation: budget-era models accept it

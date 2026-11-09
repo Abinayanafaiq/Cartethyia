@@ -8,10 +8,31 @@ current baseline; an existing one applies the numbered files that followed it.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/).
 
-## [2.7.5] - 2026-11-02
+## [2.7.5] - 2026-11-03
 
 ### Added
 
+- **Wire dialect layer for chat/messages codecs.** A dialect (DeepSeek,
+  Qwen, OpenAI/Anthropic defaults) now resolves per model below the wire
+  family, giving provider-specific quirks a home instead of scattered
+  `if (providerId === …)` branches: `reasoning_content` field naming,
+  `max_tokens` vs `max_completion_tokens`, `tool_choice` support, system
+  message cardinality, assistant-content-required tool-call turns, Qwen
+  `enable_thinking`, and in-band tool-call scanning (`<tool_call>` JSON for
+  Qwen, DSML for DeepSeek). The resolver (`resolveDialect`) is data-driven
+  with precedence DB override → `ModelDefinition.dialect` → heuristic → family
+  default, and defaults are frozen to today's behavior (byte-identical
+  payloads). Migration `0040` adds `models.dialect`. See
+  `documentation/features/09-wire-dialects.md`.
+- **Data-driven thinking/effort ladder.** The hardcoded per-model reasoning
+  effort clamps are replaced by a declarative rule table that resolves each
+  model + wire family to a `ThinkingConfig` (supported efforts + transport
+  mode: OpenAI effort, Anthropic budget/adaptive, Gemini level). One canonical
+  clamp (`clampThinkingLevelForModel`) drives chat/responses/messages, and a
+  clamped effort raises the output floor (`outputFloorFor`) so answers don't
+  truncate. Declared efforts (`reasoningEfforts` / `ModelDefinition.thinking`)
+  win over the table; defaults are byte-identical to before. No migration. See
+  `documentation/features/10-thinking-effort-ladder.md`.
 - **Quota windows are filtered by the requested model family.** Providers that
   report separate quota per model family (Antigravity: Gemini vs Claude/GPT;
   Grok: per-product buckets) no longer block every model when one family is
@@ -70,6 +91,55 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   `[image]` placeholder and never fails because of the handoff. Config lives in
   the runtime Settings (global per tenant), no migration required; the Settings
   page gains a "Vision handoff models" card with multi-select, ordered picks.
+- **Qoder IDE stream decoding is tolerant of upstream JSON quirks.** A new
+  Qoder-specific SSE decoder (`decodeQoderSseEvents`) replaces the generic
+  `decodeSseEvents` for the IDE surface: upstream emits `data:` frames whose
+  JSON payload contains literal newlines and control bytes inside string values
+  (e.g. `raw_usage`), which the generic decoder rejected as "Malformed SSE
+  line". The tolerant decoder keeps event boundaries correct while passing
+  those embedded bytes through, eliminating the malformed-line 500s on
+  auto/efficient/sonus streams.
+- **Qoder response start echoes the upstream's real model key.** The
+  `response_start` event now carries the model the upstream chunk actually names
+  (`azure-gpt6-astra`, `cmodel`, `lite`, …) instead of the virtual requested id,
+  so reported models match reality. The requested path stays routable and
+  unchanged for dispatch.
+- **Qoder thought-only streams are replayed instead of ending empty.** When the
+  upstream answers with reasoning but no text content (Sonus/Cantus thought-only
+  turns), the adapter replays the request (max 2 attempts) via
+  `fetchQoderIdeWithEmptyRecovery` to salvage a content-bearing answer, instead
+  of surfacing an empty completion.
+- **Qoder Sonus/Cantus default to `reasoning_effort: high`.** When the caller
+  sends no reasoning intent, the IDE request now carries `reasoningEffort:
+  high` for the two models that need the explicit push (verified live: Sonus
+  streams thinking only when an effort is present); DeepSeek-family models that
+  think by default are left untouched.
+- **Qoder `lite` is now a real caller-facing id.** The free-tier plan package
+  slot is published as `lite-qwen-3.7-plus` (virtual id) instead of the opaque
+  `lite` roster key — 1M ctx, 64k output ceiling, free tier, multimodal input —
+  while dispatch still routes to the `lite` slot upstream. The alias/virtual
+  layer carries the rename; no schema or migration is involved.
+- **Providers page: Models card gains a Show filter.** A selector next to the
+  Thinking effort toggle switches the grid between **All models** (default) and
+  **Free tier** — the latter hides every row the provider does not publish as
+  free (including the disabled group). The choice persists per provider in
+  localStorage, and both selectors use the compact `sm` size so the header stays
+  tight on mobile.
+- **Providers page: Accounts toolbar is compact and one-row.** The account
+  toolbar now lays out in a single row — compact search on the left, then
+  Test all / Recover / Enable / Disable / Export / Delete in a stable order,
+  with sort/select pinned to the right edge. The search no longer stretches
+  full width on desktop, and the row wraps cleanly on narrow viewports with no
+  empty gutter.
+- **Vision handoff models appear immediately after saving.** The card's model
+  list is now kept in sync with the runtime-settings query after it resolves
+  (cold cache), so a just-saved model is visible without a hard refresh — the
+  previous initializer froze the list on first render while the query could
+  still be loading.
+- **Gateway-signed model test asks for a real sample.** The provider detail
+  "Test" button now sends a 256-token budget and a prompt asking the model to
+  identify itself and its knowledge cutoff, producing a useful sample instead of
+  a canned `ping` echo.
 
 ### Changed
 
@@ -117,9 +187,66 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   Qoder included — because both signals are already per-candidate. The rank
   (fresh → slow → cooling → saturated) remains the primary sort key; credit only
   breaks ties inside one rank.
+- **Address parsing behind the admin gates and SSRF policy is now one
+  implementation.** Three previously separate parsers (SSRF allowlist, trust
+  boundary, drain admin gate) each had their own IPv4/IPv6/CIDR logic with
+  subtle differences (IPv4-mapped spellings, bare-CIDR handling, dotted-quad
+  IPv6). A single `src/network/ip-utils.ts` now serves all of them with each
+  consumer's semantics preserved exactly — fail-closed stays fail-closed,
+  allowlist strictness is unchanged, and the client-IP canonicalization key is
+  byte-identical — pinned by a 45-spelling parity test. No operator-visible
+  change; this closes the gap where the three gates could disagree on the same
+  address.
+- **Estimated token counts now appear in usage/telemetry.** When
+  `/v1/messages/count_tokens` answers from the local estimator (model on a wire
+  family without a native count endpoint), the request previously vanished from
+  telemetry entirely — no row, no latency sample, no Console Log line, because
+  the handler finalized nothing. It now flows through the same telemetry
+  finalizer as every other request (status completed, estimated usage with
+  null cost), so the usage page counts it and the latency histogram no longer
+  has a blind spot for that route.
+- **Native service routes share one request-handling core.** Image generation,
+  systemone, and the Responses-compact dispatcher now use the same shared
+  helpers (credential resolution, scope check, body validation, fetch context,
+  usage read-back) as the token-count and websearch routes instead of private
+  copies that had already drifted — image/embedding JSON responses now carry
+  `cache-control: no-store`, which their private serializer forgot.
+- **Routing eligibility types match reality.** The evaluator no longer casts
+  the route candidate to an anonymous structural extension: the post-catalog
+  shape (`RoutedCandidate`) is a shared type, `quota_windows` is properly typed
+  end-to-end, and dead defensive fields (`account_locked`/`locked`, producible
+  by nothing) with their unreachable rejection reason are gone.
+- **Messages OAuth thinking-budget requests fail fast and clearly.** An OAuth
+  request whose thinking budget cannot fit under the OAuth `max_tokens` ceiling
+  used to be encoded with a max_tokens above the ceiling and rejected by
+  Anthropic with an opaque upstream error; it now returns a clean local 400
+  naming the budget/ceiling conflict.
+- **PKCE verifier for the Qoder device flow is fully CSPRNG.** The verifier
+  bytes already came from `randomBytes`, but its length (43–128) was drawn from
+  `Math.random` — RFC 7636 requires the whole verifier to come from a secure
+  generator. It is now a fixed 64 characters (inside the IDE's own range, so
+  fingerprinting fidelity is kept) from CSPRNG end to end. Note this refines
+  the device-login entry above: the alphabet stays byte-identical with the
+  IDE, the length is now a fixed 64 instead of variable.
+- **Cursor roster cache is bounded.** The per-account model-roster cache was
+  unbounded, keyed by the raw credential, and never evicted expired entries —
+  token rotation grew it without limit. It is now capped at 1024 entries with
+  oldest-first eviction and keyed by a hash of the credential instead of the
+  token itself.
 
 ### Fixed
 
+- **Vision handoff no longer forwards a giant session to the main model.** A
+  handoff on a large CLI session (700+ tool-result turns, multi-megabyte body)
+  replaced the image parts but still sent the whole transcript — including
+  hundreds of tool results — to the text-only model verbatim. Upstreams reset
+  or reject such payloads (502/ECONNRESET) even though the handoff only needs
+  to describe the attached image, appearing as "broken on large sessions"
+  (small fresh chats worked). The handoff now condenses the request first: for
+  a huge session it keeps only the system prompt plus the active
+  image-carrying turn; small requests pass through untouched. The description
+  is also explicitly framed as an automated vision-model description, so the
+  main model no longer treats it as prose the user typed.
 - **Postgres traffic telemetry no longer falls back to SQLite SQL.** The
   dialect check (`isPostgres`) reported Postgres for any handle whenever the
   process env was `CARTETHYIA_DB_MODE=full`, so a SQLite handle received
@@ -191,6 +318,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   reached the client. The encoder now defaults to `summary: "detailed"` when
   effort is set (an explicit `summary`/`summary_mode` still wins). Verified
   live against Copilot's `/auto` → `/responses` path.
+- **GitHub Copilot Auto → Responses no longer 500s on unrepairable tool
+  arguments.** A `github/gpt-6-luna` request that carried a tool call whose
+  argument was not near-JSON (e.g. a multiline `*** Begin Patch` fragment) hit
+  a 500 `internal_error` after the `/auto` selection succeeded: the Responses
+  encoder's `repairToolArguments` called `jsonrepair` outside its try/catch,
+  so the throw bubbled through `preparePayload` into the generic error
+  middleware. The raw argument is now returned unchanged when repair fails,
+  matching the documented non-object policy; the request streams normally.
 - **Provider list/detail and Usage pages no longer scan the whole telemetry
   window.** Three heavy DB reads were behind the slow page loads:
   - `listAccounts`/`listAllAccounts` read **today's** per-account usage via
@@ -291,6 +426,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/).
   version read), reuses that payload on every open, and refreshes only while it
   is open — closing it stops the polling. This fixes the panel showing "System
   health unavailable" with every metric Unavailable.
+- **Telemetry reconciliation counted zero completed files.** The reconciliation
+  state row incremented `files_completed + 0` instead of `+ 1`, so the
+  "files completed" counter never moved regardless of how many drain files were
+  processed.
+- **The usage chart's "cached" series plotted total input tokens.** The console
+  usage chart read the wrong SQL aggregate for its cached-token series, so the
+  cached share of the prompt was drawn as the full input line.
+- **DNS resolution failures are classified deterministically.** Two stacked
+  5-second DNS timeout timers in the pooled dial path raced each other, so a
+  stalled lookup could surface as a 502 `transport_unavailable` or a 499/504
+  abort-shaped error depending on which timer won. The inner deadline (which
+  owns the correct classification) is now the only one.
+- **A login ban's human-readable label can no longer be forged in the audit
+  trail.** The API-key ban endpoint stored a client-supplied free-text
+  `reasonLabel` in the audit record — attacker-controlled text next to the
+  machine-readable reason operators use for forensics. The label is now derived
+  server-side from the ban reason, and unknown/custom reasons simply carry no
+  label.
+- **Leftover dead code from earlier passes is removed, and stale docs with
+  it.** Unused codec preload hooks (whose docs claimed a boot warm-up that
+  never existed), a dead capability-unsupported error constructor, a dead
+  antigravity endpoint-order helper, dead SSE header writes the framework
+  discarded, a stale "15 minutes" payload-retention comment (it has been an
+  hour for a while), a defensive double-cast with an unreachable fallback in
+  the codec's string sanitizer, a redundant three-way branch in the Anthropic
+  cache-control builder, and duplicated FNV-1a hash implementations — all gone,
+  with the type-level duplicates (`BackupExportResult` near-miss naming)
+  renamed so the next grep finds one of each.
+
+### Removed
+
+- **`src/network/response-headers.ts`.** The denylist response-header stripper
+  has no caller: caller-facing responses are built from scratch by the proxy
+  projection, and upstream response headers are never forwarded wholesale, so
+  the strip set was unreachable. The invariant ("upstream headers are never
+  forwarded wholesale") is now documented at the projection site. If a raw
+  passthrough transport is ever added, resurrect the strip set from git
+  history.
 
 ## [2.7.4] - 2026-11-01
 

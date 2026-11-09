@@ -22,7 +22,7 @@ import type {
   ToolDefinition,
 } from "../../../protocol/canonical-model";
 import { toolResultParts, toolCallParts } from "../../../protocol/canonical-model";
-import { decodeSseEvents } from "../../../protocol/sse-decoder";
+import { decodeQoderSseEvents } from "./qoder-sse";
 import { usageFromProvider, readReasoningText } from "../../provider-usage";
 import { readCredentialSecret, assertWireFamily, type ProviderDispatchTarget, type ProviderAdapter, type ProviderDispatchContext, type ProviderId } from "../../provider-contracts";
 import type { ModelDefinition } from "../../provider-model-definition";
@@ -127,26 +127,6 @@ export const MODERN_PROFILE: QoderModeProfile = {
 
 const QODER_PROVIDER_ID = "qoder" as const;
 
-export const QODER_MODEL_CONFIGS: Record<
-  string,
-  { id: string; display_name: string; max_input_tokens: number; max_output_tokens?: number; is_vl: boolean; is_reasoning: boolean; source?: string }
-> = {
-  auto: { id: "auto", display_name: "Auto", max_input_tokens: 180000, is_vl: true, is_reasoning: false },
-  ultimate: { id: "ultimate", display_name: "Ultimate", max_input_tokens: 180000, is_vl: true, is_reasoning: true },
-  performance: { id: "performance", display_name: "Performance", max_input_tokens: 272000, is_vl: true, is_reasoning: false },
-  efficient: { id: "efficient", display_name: "Efficient", max_input_tokens: 180000, is_vl: true, is_reasoning: false },
-  lite: { id: "lite", display_name: "Lite", max_input_tokens: 180000, is_vl: false, is_reasoning: true },
-  qmodel: { id: "qmodel", display_name: "Qwen 3.6 Plus", max_input_tokens: 180000, is_vl: true, is_reasoning: false },
-  qmodel_latest: { id: "qmodel_latest", display_name: "Qwen 3.7 Max", max_input_tokens: 1000000, is_vl: true, is_reasoning: false },
-  qmodel_preview: { id: "qmodel_preview", display_name: "Qwen 3.8 Max", max_input_tokens: 1000000, is_vl: true, is_reasoning: false },
-  dmodel: { id: "dmodel", display_name: "DeepSeek V4 Pro", max_input_tokens: 180000, is_vl: true, is_reasoning: true },
-  dfmodel: { id: "dfmodel", display_name: "DeepSeek V4 Flash", max_input_tokens: 180000, is_vl: true, is_reasoning: true },
-  gm51model: { id: "gm51model", display_name: "GLM 5.1", max_input_tokens: 180000, is_vl: true, is_reasoning: true },
-  kmodel: { id: "kmodel", display_name: "Kimi K2.6", max_input_tokens: 256000, is_vl: true, is_reasoning: false },
-  mmodel: { id: "mmodel", display_name: "MiniMax M2.7", max_input_tokens: 180000, is_vl: true, is_reasoning: false },
-  kmodel_latest: { id: "kmodel_latest", display_name: "Kimi K2.7 Latest", max_input_tokens: 256000, is_vl: true, is_reasoning: false },
-};
-
 const QODER_APPCODE = "cosy";
 const QODER_SIG_SECRET = "d2FyLCB3YXIgbmV2ZXIgY2hhbmdlcw==";
 /**
@@ -200,6 +180,11 @@ interface QoderModelConfig {
    */
   is_free?: boolean;
   source?: string;
+  /**
+   * Reasoning effort to send when the caller did not ask for one. Some models
+   * on the IDE surface stream no reasoning unless an effort is present.
+   */
+  default_reasoning_effort?: string;
 }
 
 function qoderMd5(value: string | Uint8Array): string {
@@ -473,7 +458,7 @@ function qoderEnvelopeMessage(rec: Record<string, unknown>): string {
   return extractUpstreamMessage(rec);
 }
 
-function qoderEnvelopeToFrames(data: string): Array<{ event: string | null; data: string }> {
+export function qoderEnvelopeToFrames(data: string): Array<{ event: string | null; data: string }> {
   if (data === "[DONE]") return [{ event: null, data: "[DONE]" }];
   let envelope: unknown;
   // The IDE surface sometimes embeds literal newlines inside JSON string
@@ -656,13 +641,23 @@ function qoderMaxContextFor(modelId: string, modelConfig: QoderModelConfig, real
   return modelConfig.max_input_tokens;
 }
 
-function qoderRequestedMaxTokens(request: CanonicalRequest, modelConfig: QoderModelConfig): number {
+function qoderRequestedMaxTokens(
+  request: CanonicalRequest,
+  modelConfig: QoderModelConfig,
+  realm: QoderRealm,
+): number {
   /**
    * The ceiling is the roster's stated one. A fixed 32k fallback would clamp
    * every model alike, so a request asking for more would be silently lowered
-   * no matter which model it named.
+   * no matter which model it named. A discovered row carries no
+   * `max_output_tokens` (upstream's model list reports none), so consult the
+   * static roster for the key before the 65_536 last resort — and keep that
+   * last resort only when neither the caller nor the roster states a limit.
    */
-  const configured = typeof modelConfig.max_output_tokens === "number" ? modelConfig.max_output_tokens : 65_536;
+  const configured =
+    typeof modelConfig.max_output_tokens === "number"
+      ? modelConfig.max_output_tokens
+      : qoderRosterMaxOutput(modelConfig.id, realm) ?? 65_536;
   const controls = request.generation_controls as Record<string, unknown>;
   const requested =
     typeof controls["max_tokens"] === "number"
@@ -671,6 +666,17 @@ function qoderRequestedMaxTokens(request: CanonicalRequest, modelConfig: QoderMo
         ? (controls["max_output_tokens"] as number)
         : null;
   return typeof requested === "number" && requested > 0 ? Math.min(requested, configured) : configured;
+}
+
+/**
+ * The static roster's stated output ceiling for one key, when the roster states
+ * one. Dispatch builds a live-discovered model's config without an output limit
+ * (upstream's model list reports none); this lookup restores the roster's
+ * ceiling so such a model is not capped at the 65_536 last resort.
+ */
+function qoderRosterMaxOutput(modelId: string, realm: QoderRealm): number | undefined {
+  const configs = realm === "cn" ? QODER_CN_MODEL_CONFIGS : QODER_INTL_MODEL_CONFIGS;
+  return configs[modelId]?.max_output_tokens;
 }
 
 /**
@@ -1001,13 +1007,17 @@ export function buildQoderRequest(
   }
   const latestUserMessage = [...qoderMessages].reverse().find((m) => m["role"] === "user");
   const latestUserText = typeof latestUserMessage?.["content"] === "string" ? (latestUserMessage["content"] as string) : "";
-  const maxTokens = qoderRequestedMaxTokens(request, modelConfig);
+  const maxTokens = qoderRequestedMaxTokens(request, modelConfig, realm);
   const reasoning = modelConfig.is_reasoning === true;
   // 1:1 with the IDE worker's `FTn` legacy builder, which sends reasoning
   // effort as a top-level camelCase field (`reasoningEffort`), derived from
   // the canonical intent when one is present. Omitted entirely when the
   // caller asked for no reasoning, matching the reference's conditional send.
-  const reasoningEffort = reasoningEffortFromIntent(request.reasoning);
+  // When the caller sends no intent but the model needs the push to think
+  // (verified live: Sonus/Cantus stream no reasoning without it), use the
+  // roster's default effort.
+  const reasoningEffort =
+    reasoningEffortFromIntent(request.reasoning) ?? modelConfig.default_reasoning_effort;
   const sessionId = qoderStableHash("qoder-session", auth.userId, modelId);
   const recordId = qoderStableRecordId(modelId, allMessages, maxTokens);
   return {
@@ -1062,8 +1072,9 @@ export function buildQoderRequest(
       max_input_tokens: qoderMaxContextFor(modelId, modelConfig, realm),
       // Mirrors the roster's stated ceiling. A fixed 32k fallback would be sent
       // for every model alike, so the request would declare a cap the catalog
-      // does not publish.
-      max_output_tokens: modelConfig.max_output_tokens ?? 65_536,
+      // does not publish. A discovered model's config carries no output limit,
+      // so consult the roster for the key before the 65_536 last resort.
+      max_output_tokens: modelConfig.max_output_tokens ?? qoderRosterMaxOutput(modelId, realm) ?? 65_536,
       source: modelConfig.source ?? "system",
     },
     messages: qoderMessages,
@@ -1108,6 +1119,16 @@ export function buildQoderIdeRequest(
     messages,
     stream: true,
     stream_options: { include_usage: true },
+    // The same reasoning-effort field the legacy surface uses; without it the
+    // IDE surface streams no thinking for models that need the push (Sonus,
+    // Cantus). Undefined when the caller asked for none and the roster has no
+    // default, matching the legacy builder.
+    ...(legacy.reasoningEffort === undefined ? {} : { reasoningEffort: legacy.reasoningEffort }),
+    // The full wire config (model key, window, output ceiling, tier) the legacy
+    // surface sends. The IDE surface reads the same block, so shipping it keeps
+    // the request the same shape for every Qoder model — including lite's 1M
+    // window and 64k output cap.
+    ...(legacy.model_config === undefined ? {} : { model_config: legacy.model_config }),
     metadata: {
       context: {
         request_id: legacy.request_id,
@@ -1195,6 +1216,120 @@ function qoderIdeEntitlementRefused(response: Response): boolean {
   return response.status === 402;
 }
 
+/**
+ * Qoder upstream streams are flaky: the IDE surface sometimes answers a full
+ * normal stop with reasoning only and no output text/tool calls (observed ~1
+ * in 4 runs with Sonus). That is not a valid completion — the lab would show a
+ * thought with "No text came back". Replay such a stream before committing to
+ * it. Buffering the body is required: the decision is only knowable after the
+ * stream ends, and the bytes are replayed to the canonical parser.
+ */
+interface QoderStreamDrain {
+  readonly bytes: Uint8Array;
+  readonly meaningful: boolean;
+  readonly thoughtOnly: boolean;
+}
+
+async function drainQoderResponse(
+  response: Response,
+  signal: AbortSignal,
+): Promise<QoderStreamDrain> {
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = response.body!.getReader();
+  try {
+    for (;;) {
+      if (signal.aborted) break;
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        total += value.byteLength;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  let dataEvents = 0;
+  let meaningful = false;
+  let thoughtOnly = false;
+  const decoder = new TextDecoder();
+  const text = decoder.decode(bytes);
+  for (const frame of text.split(/\r?\n\r?\n/)) {
+    if (frame.trim().length === 0) continue;
+    const dataLines: string[] = [];
+    for (const line of frame.split(/\r?\n/)) {
+      if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    }
+    const data = dataLines.join("\n").trim();
+    if (data.length === 0 || data === "[DONE]") continue;
+    dataEvents++;
+    for (const { data: frameData } of qoderEnvelopeToFrames(data)) {
+      if (frameData === "[DONE]") continue;
+      let json: Record<string, unknown>;
+      try {
+        json = JSON.parse(frameData) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const choices = json["choices"];
+      if (!Array.isArray(choices)) continue;
+      for (const choice of choices as Array<Record<string, unknown>>) {
+        const delta = choice["delta"] as Record<string, unknown> | undefined;
+        if (delta === undefined) continue;
+        if (typeof delta["content"] === "string" && (delta["content"] as string).length > 0) {
+          meaningful = true;
+          return { bytes, meaningful, thoughtOnly };
+        }
+        if (Array.isArray(delta["tool_calls"]) && (delta["tool_calls"] as unknown[]).length > 0) {
+          meaningful = true;
+          return { bytes, meaningful, thoughtOnly };
+        }
+        if (
+          typeof delta["reasoning_content"] === "string" &&
+          (delta["reasoning_content"] as string).length > 0
+        ) {
+          thoughtOnly = true;
+        }
+      }
+    }
+  }
+  return { bytes, meaningful, thoughtOnly };
+}
+
+/**
+ * Runs the IDE request up to `1 + maxReplays` times, returning the first
+ * response whose stream carried real output (text or tool calls). A 200 with
+ * no output (empty or thought-only) is replayed rather than surfaced.
+ */
+async function fetchQoderIdeWithEmptyRecovery(
+  requestOnce: () => Promise<Response>,
+  signal: AbortSignal,
+  maxReplays = 2,
+): Promise<Response> {
+  let last: Response | undefined;
+  for (let attempt = 0; attempt <= maxReplays; attempt += 1) {
+    const res = await requestOnce();
+    if (!res.ok || !res.body) return res;
+    const drain = await drainQoderResponse(res, signal);
+    last = new Response(drain.bytes as BodyInit, {
+      status: 200,
+      headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
+    });
+    if (drain.meaningful) return last;
+  }
+  return last!;
+}
+
+export { fetchQoderIdeWithEmptyRecovery };
+
 // Stream transformation — decode SSE, unwrap COSY envelope, map OpenAI chat chunks to CanonicalEvent
 
 function mapQoderFinishReason(raw: unknown): CanonicalStopReason | undefined {
@@ -1212,7 +1347,7 @@ export async function* qoderBodyToCanonicalEvents(
   tools: readonly QoderDsmlTool[] = [],
 ): AsyncIterable<CanonicalEvent> {
   let seq = 1;
-  yield { type: "response_start", sequence_number: seq++, model } as CanonicalEvent;
+  let started = false;
   let finishReason: unknown = undefined;
   let rawUsage: Record<string, unknown> | undefined = undefined;
   let hasTerminal = false;
@@ -1233,7 +1368,7 @@ export async function* qoderBodyToCanonicalEvents(
   let dsmlBuf = "";
   let dsmlTail = "";
 
-  for await (const sse of decodeSseEvents(body, { signal })) {
+  for await (const sse of decodeQoderSseEvents(body, signal)) {
     const sseData = sse.data;
     let frames: Array<{ event: string | null; data: string }>;
     try {
@@ -1246,6 +1381,10 @@ export async function* qoderBodyToCanonicalEvents(
       if (!data) continue;
       if (data === "[DONE]") {
         hasTerminal = true;
+        if (!started) {
+          yield { type: "response_start", sequence_number: seq++, model } as CanonicalEvent;
+          started = true;
+        }
         continue;
       }
       let json: Record<string, unknown>;
@@ -1253,6 +1392,18 @@ export async function* qoderBodyToCanonicalEvents(
         json = JSON.parse(data) as Record<string, unknown>;
       } catch {
         continue;
+      }
+      // The upstream names the real model in each chunk. Use the first one we
+      // see for the opening event so the client sees the same model the
+      // provider actually served, not the (virtual) id that was requested.
+      if (!started && typeof json["model"] === "string") {
+        const upstreamModel = (json["model"] as string).trim();
+        yield {
+          type: "response_start",
+          sequence_number: seq++,
+          model: upstreamModel.length > 0 ? upstreamModel : model,
+        } as CanonicalEvent;
+        started = true;
       }
       // IDE surface error event: `{"code":"invalid_model_error","message":"..."}`
       // carries no choices. Surface it as an upstream failure instead of an
@@ -1531,10 +1682,13 @@ export async function* qoderBodyToCanonicalEvents(
     }
   }
   // A `[DONE]` frame from the IDE surface may be the only terminal signal (the
-  // per-delta `finish_reason` is empty and `raw_usage` is not always sent), so
+  // //-delta `finish_reason` is empty and `raw_usage` is not always sent), so
   // a clean end-of-stream with no finish reason is a normal stop, not a
   // truncation. If no terminal arrived at all, still synthesize one (prevents
   // truncation error).
+  if (!started) {
+    yield { type: "response_start", sequence_number: seq++, model } as CanonicalEvent;
+  }
   if (hasTerminal && finishReason === undefined) finishReason = "stop";
   const stopReason = mapQoderFinishReason(finishReason);
   const _providerStop = typeof finishReason === "string" ? finishReason : undefined;
@@ -1549,17 +1703,13 @@ export async function* qoderBodyToCanonicalEvents(
   } as CanonicalEvent;
 }
 
-// Model catalog — maps QODER_MODEL_CONFIGS (provider) to Cartethyia ModelDefinition
+// Model catalog — maps the realm's roster to Cartethyia ModelDefinition
 
 /**
  * The intl catalog this provider publishes.
  *
- * `QODER_MODEL_CONFIGS` is not the source here: it freezes most rows at 180k
- * while the upstream reports 1M for the same keys. That number is not
- * cosmetic: it is sent upstream as `model_config.max_input_tokens`, so a stale
- * low value tells Qoder the conversation window is small and makes it behave
- * that way. Both the published catalog and the dispatched request come from the
- * realm's roster, which carries the upstream's own numbers.
+ * The published catalog and the dispatched request both come from the realm's
+ * roster, which carries the upstream's own numbers.
  */
 export const QODER_MODELS: readonly ModelDefinition[] = QODER_INTL_MODELS;
 
@@ -1697,7 +1847,9 @@ class QoderAdapter implements ProviderAdapter {
       const cosyRequest = () =>
         callQoder(cosyUrl, buildQoderRequest(modelId, request, modelConfig, auth, this.realm), modelId, auth, lifecycle.signal, fetcher, version);
       let response =
-        this.surface === "ide" ? await ideRequest() : await cosyRequest();
+        this.surface === "ide"
+          ? await fetchQoderIdeWithEmptyRecovery(ideRequest, lifecycle.signal)
+          : await cosyRequest();
       if (
         !response.ok &&
         this.surface === "ide" &&

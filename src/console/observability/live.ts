@@ -34,7 +34,7 @@ import { poolByteSnapshot } from "../../network/pool/byte-accounting";
 import { consoleSseResponse, createConsoleSseStream } from "./sse";
 import { subscribeRequestCompleted } from "../../observability/request-notify";
 
-export interface LiveConfig {
+interface LiveConfig {
   readonly accessResolver: ConsoleAccessResolver;
   readonly poolSelector?: NetworkPoolSelector;
   readonly db?: CartethyiaDatabase;
@@ -94,10 +94,9 @@ export function createLiveRoutes(config: LiveConfig): AnyElysia {
         requireScope(access, "dashboard:read");
         const tenantId = access?.tenantId;
         if (!tenantId) return errorResponse(new Error("Tenant required"), set, "Live operation failed");
-        set.headers["content-type"] = "text/event-stream";
-        set.headers["cache-control"] = "no-cache, no-transform";
-        set.headers["connection"] = "keep-alive";
-        set.headers["x-accel-buffering"] = "no";
+        // No `set.headers` writes here: this handler returns a `Response`, so
+        // Elysia discards `set` and `consoleSseResponse` below owns the SSE
+        // headers (content-type, cache-control, connection, buffering).
         return consoleSseResponse(
           createConsoleSseStream(request.signal, ({ send }) => {
             return subscribeRequestCompleted((notice) => {
@@ -119,22 +118,36 @@ export function createLiveRoutes(config: LiveConfig): AnyElysia {
     })
     .get("/live/in-flight/stream", ({ request, set }) => {
       try {
-        requireScope(config.accessResolver(request), "dashboard:read");
+        const access = requireScope(config.accessResolver(request), "dashboard:read");
+        const tenantId = access?.tenantId;
+        return consoleSseResponse(
+          createConsoleSseStream(request.signal, ({ send }) => {
+            const store = config.stateStore;
+            if (!store) {
+              send("count", EMPTY_IN_FLIGHT);
+              return () => {};
+            }
+            // The Usage page keeps one stream open for both the in-flight gauge
+            // and request-table invalidation, so this route also fans out
+            // `request_completed` events (tagged by kind) for the tenant,
+            // mirroring `/live/requests/stream`.
+            const unsubscribe = store.subscribeInFlight((snapshot) => send("count", snapshot));
+            let unsubscribeCompleted: (() => void) | undefined;
+            if (tenantId) {
+              unsubscribeCompleted = subscribeRequestCompleted((notice) => {
+                if (notice.tenantId === tenantId) send("request_completed", notice);
+              });
+            }
+            send("count", store.inFlightSnapshot());
+            return () => {
+              unsubscribe();
+              unsubscribeCompleted?.();
+            };
+          }),
+        );
       } catch (e) {
         return errorResponse(e, set, "Live operation failed");
       }
-      return consoleSseResponse(
-        createConsoleSseStream(request.signal, ({ send }) => {
-          const store = config.stateStore;
-          if (!store) {
-            send("count", EMPTY_IN_FLIGHT);
-            return () => {};
-          }
-          const unsubscribe = store.subscribeInFlight((snapshot) => send("count", snapshot));
-          send("count", store.inFlightSnapshot());
-          return unsubscribe;
-        }),
-      );
     })
     .get("/live/pools", async ({ request, set }) => {
       try {

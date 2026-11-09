@@ -205,7 +205,7 @@ function percentile(sorted: readonly number[], fraction: number): number {
   return Math.round(sorted[index] ?? 0);
 }
 
-export interface UsagePerformanceSummary {
+interface UsagePerformanceSummary {
   avgResolveMs: number;
   avgDurationMs: number;
   latencyP50Ms: number;
@@ -537,7 +537,7 @@ export class DrizzleObservabilityStore implements ObservabilityStore {
         input: bucket.inputTokens,
         // `cached` is the cached share of the prompt: the SQL reader sums
         // cached_input_tokens, which is the same number the old JS loop used.
-        cached: bucket.inputTokens,
+        cached: bucket.cachedInputTokens,
         output: bucket.outputTokens,
       });
     }

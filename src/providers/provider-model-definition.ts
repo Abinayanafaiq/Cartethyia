@@ -9,6 +9,7 @@
  * back to the prebuilt base catalog; capability does not — see `defineModel`.
  */
 import type { ServiceKind, WireFamily } from "../protocol/canonical-model";
+import type { DialectId } from "../protocol/translation/dialect/types";
 import { modelsDevCatalog } from "./discovery/models-dev-catalog";
 
 /** Billing metadata for one provider model. */
@@ -53,8 +54,22 @@ export interface ModelDefinition {
   readonly reasoning: boolean;
   /** Explicitly supported reasoning effort scale (e.g. `["minimal", "low", "medium", "high", "xhigh"]`). */
   readonly reasoningEfforts?: readonly string[];
+  /**
+   * Optional thinking/effort override for this row. When present, the ladder
+   * resolver prefers these efforts and transport mode over the rule table.
+   * Compile-time only — no DB column (see `thinking-ladder.ts`).
+   */
+  readonly thinking?: {
+    readonly efforts?: readonly string[];
+    readonly mode?: "effort" | "budget" | "anthropic-adaptive" | "google-level";
+  };
   readonly toolCall: boolean;
   readonly cost: ModelCostDefinition;
+  /**
+   * Explicit wire dialect for this row. Absent = resolver fallback (heuristic
+   * + family default) — see `src/protocol/translation/dialect/`.
+   */
+  readonly dialect?: DialectId;
   /**
    * Whether the provider serves this row on a free plan tier.
    *
@@ -168,6 +183,8 @@ export interface ModelHelperRow {
   readonly output?: readonly ModelDefinition["modalities"]["output"][number][];
   /** Explicitly supported reasoning effort scale. */
   readonly reasoningEfforts?: readonly string[];
+  /** Optional thinking/effort override; see `ModelDefinition.thinking`. */
+  readonly thinking?: ModelDefinition["thinking"];
   readonly toolCall?: boolean;
   /**
    * Marks a row served by a free plan tier. Such rows bill zero per token
@@ -186,6 +203,8 @@ export interface ModelHelperRow {
   readonly freeTier?: boolean;
   /** Whether the provider refuses this row on a free plan. See `ModelDefinition.proOnly`. */
   readonly proOnly?: boolean;
+  /** Explicit wire dialect override for this row. See `ModelDefinition.dialect`. */
+  readonly dialect?: DialectId;
 }
 
 function defaultEndpoint(wireFamily: ModelDefinition["wireFamily"]): string {
@@ -283,10 +302,12 @@ export function defineModel(row: ModelHelperRow): ModelDefinition {
     },
     reasoning: row.reasoning ?? false,
     ...(row.reasoningEfforts !== undefined ? { reasoningEfforts: row.reasoningEfforts } : {}),
+    ...(row.thinking === undefined ? {} : { thinking: row.thinking }),
     toolCall: row.toolCall ?? true,
     cost,
     ...(row.freeTier === undefined ? {} : { freeTier: row.freeTier }),
     ...(row.proOnly === undefined ? {} : { proOnly: row.proOnly }),
+    ...(row.dialect === undefined ? {} : { dialect: row.dialect }),
     ...(limitsEstimated ? { limitsEstimated: true } : {}),
   };
 }

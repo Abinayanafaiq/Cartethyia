@@ -38,7 +38,7 @@ import { UpdateDialog, readDismissedUpdate, dismissUpdate } from "../../componen
 import { clearPersistedCache, queryClient } from "../../data/query-client";
 import { prefetchRouteIntent } from "../../data/route-prefetch";
 import { POLL } from "../../data/query-policy";
-import { useSystemHealth, useLatestRelease, useNotifications } from "../../hooks/system";
+import { useSystemHealth, useLatestRelease, useNotifications, type NotificationItem } from "../../hooks/system";
 import { useProviders } from "../../hooks/providers";
 import { DASHBOARD_RELEASE_LABEL, DASHBOARD_VERSION } from "../../lib/version";
 import { formatUptime } from "../../lib/format/numbers";
@@ -256,8 +256,11 @@ function MetricTile({
 }
 
 function NotificationsPopover({
+  notifications,
   onOpenUpdate,
 }: {
+  /** Live server-generated alerts; owned by the shell so it can key the badge. */
+  readonly notifications: readonly NotificationItem[];
   /** Opens the update dialog. A release alert is answered there, not on GitHub. */
   onOpenUpdate: () => void;
 }) {
@@ -265,7 +268,6 @@ function NotificationsPopover({
   const [now, setNow] = useState(() => new Date());
   const triggerRef = useRef<HTMLButtonElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  const notifications = useNotifications();
   // Health is loaded lazily, keyed to the popover: the first open fetches it
   // (the shell's version read usually already warmed the cache), every open
   // reuses that cached payload, and the refresh timer runs only while the
@@ -695,41 +697,95 @@ export function DashboardShell({
   const [logoutOpen, setLogoutOpen] = useState(false);
   const [updateOpen, setUpdateOpen] = useState(false);
   const [updating, setUpdating] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
   const handleUpdateNow = async (): Promise<void> => {
     setUpdating(true);
+    setUpdateError(null);
     try {
       await consoleRequest<void>("/updates/apply", { method: "POST" });
-    } catch {
+    } catch (error) {
       setUpdating(false);
+      setUpdateError(
+        typeof error === "object" && error !== null && "message" in error
+          ? String((error as { message: unknown }).message)
+          : "The update could not be started.",
+      );
       return;
     }
     // block refresh
     const beforeUnload = (e: BeforeUnloadEvent): void => { e.preventDefault(); };
     window.addEventListener("beforeunload", beforeUnload);
-    // poll until version changes
+    // Poll the update status file, not the release tag: the installer reports
+    // success or failure itself, so a failed npm run ends the loop with an
+    // error instead of polling forever against a tag that never changes.
     const target = latestTag;
+    const stop = (): void => {
+      window.clearInterval(poll);
+      window.removeEventListener("beforeunload", beforeUnload);
+    };
     const poll = window.setInterval(async () => {
       try {
-        const res = await fetch("/console/api/updates/release");
-        const data = (await res.json()) as { tag_name?: string };
-        if (target !== undefined && data.tag_name !== target) {
-          window.clearInterval(poll);
-          window.removeEventListener("beforeunload", beforeUnload);
+        const res = await fetch("/console/api/updates/status");
+        const data = (await res.json()) as { status?: string; stderrTail?: string };
+        if (data.status === "failed") {
+          stop();
+          setUpdating(false);
+          setUpdateError(
+            `The install failed${data.stderrTail ? `: ${data.stderrTail}` : ". See update.log in the config directory."}`,
+          );
+          return;
+        }
+        if (data.status === "success") {
+          stop();
+          // Verify the running version actually moved before reloading: a
+          // success that did not change the version would loop back to the
+          // same badge.
+          try {
+            const health = await fetch("/console/api/system/health");
+            const body = (await health.json()) as { version?: string };
+            if (body.version !== undefined && target !== undefined && body.version === target) {
+              window.location.reload();
+              return;
+            }
+          } catch {
+            // The gateway may still be restarting; fall back to reloading.
+          }
           window.location.reload();
+          return;
         }
       } catch {
-        // server restarting; keep polling
+        // Server restarting; keep polling. Fall back to the release-tag check
+        // so an old gateway without /updates/status still terminates the loop.
+        try {
+          const res = await fetch("/console/api/updates/release");
+          const data = (await res.json()) as { tag_name?: string };
+          if (target !== undefined && data.tag_name !== undefined && data.tag_name !== target) {
+            stop();
+            window.location.reload();
+          }
+        } catch {
+          // Keep polling.
+        }
       }
     }, 3000);
   };
   const healthQuery = useSafeSystemHealth();
+  // The release query is the cold-start fallback only: the notifications
+  // stream is the primary `update-available` badge/dialog source (S-04). The
+  // fetch runs once on mount and is never polled; the live stream announces a
+  // release when it appears. A stale badge on a fresh browser is still covered
+  // by the fallback.
   const releaseQuery = useLatestRelease();
+  const notifications = useNotifications();
   // The running version is the gateway's, not the bundled dashboard's: the
   // badge answers "is the install behind", and the install is what an operator
   // upgrades. Falls back to the dashboard label so the badge still reads.
   const localVersion = healthQuery.data?.version ?? DASHBOARD_VERSION;
-  const latestTag = releaseQuery.data?.tag_name?.replace(/^v/, "");
-  const updateAvailable = isNewerRelease(localVersion, latestTag);
+  const streamUpdate = notifications.find((item) => item.kind === "update-available");
+  const latestTag =
+    streamUpdate?.version ?? releaseQuery.data?.tag_name?.replace(/^v/, "");
+  const updateAvailable =
+    streamUpdate !== undefined || isNewerRelease(localVersion, latestTag);
   const providersQuery = useProviders();
   // Prompts once per release, not once per load: the point of showing it at all
   // is that an operator running an old version may never think to look. But a
@@ -911,6 +967,7 @@ export function DashboardShell({
               <HeaderExtras />
               <ThemeToggle />
               <NotificationsPopover
+                notifications={notifications}
                 onOpenUpdate={() => setUpdateOpen(true)}
               />
             </div>
@@ -938,14 +995,15 @@ export function DashboardShell({
         onClose={() => setUpdateOpen(false)}
         currentVersion={localVersion}
         {...(latestTag === undefined ? {} : { latestVersion: latestTag })}
-        {...(releaseQuery.data?.html_url === undefined
+        {...(streamUpdate?.href ?? releaseQuery.data?.html_url) === undefined
           ? {}
-          : { releaseUrl: releaseQuery.data.html_url })}
+          : { releaseUrl: streamUpdate?.href ?? releaseQuery.data?.html_url }}
         {...(latestTag === undefined
           ? {}
           : { onDismissVersion: () => dismissUpdate(latestTag) })}
         onUpdateNow={handleUpdateNow}
         updating={updating}
+        {...(updateError === null ? {} : { error: updateError })}
       />
     </>
   );

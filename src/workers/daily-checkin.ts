@@ -1,5 +1,9 @@
 // Daily check-in ride-along.
 //
+// dynamic-import-ok: the qoder/buddy check-in imports are lazy-loaded
+// inside the account loop (B-02) so the boot graph stays clean — this runs
+// as a ride-along with the quota sweep, not at startup.
+//
 // WorkBuddy/CodeBuddy grant a free credit package once per calendar day. This
 // claims it for every stored account and logs one line per account, so an
 // operator can confirm each account got its daily login credit.
@@ -23,20 +27,35 @@ import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { dailyCheckinLedger, networkPools } from "../persistence/schema";
 import type { ProviderId } from "../providers/provider-contracts";
 import { log } from "../observability/logger";
-import {
-  DAILY_CHECKIN_PROVIDER_IDS,
-  checkinDayKey,
-  fetchDailyCheckin,
-  type DailyCheckinResult,
-} from "../providers/integrations/buddy/buddy-checkin";
-import {
-  fetchQoderDailyCheckin,
-  isQoderCheckinProvider,
-} from "../providers/integrations/qoder/qoder-checkin";
-import { DrizzleQoderNativeIdentityStore } from "../providers/integrations/qoder/qoder-native-identity-store";
+import type { DailyCheckinResult } from "../providers/integrations/buddy/buddy-checkin";
+import { BUDDY_PROVIDER_IDS } from "../providers/provider-metadata";
 
-export { DAILY_CHECKIN_PROVIDER_IDS, checkinDayKey };
 export type { DailyCheckinResult };
+
+/**
+ * Calendar-day key in UTC, matching the provider's own day boundary.
+ *
+ * Mirrors `buddy-checkin.ts`'s `checkinDayKey` (a pure two-line util). Kept
+ * local so this worker module does not statically import the heavy buddy-checkin
+ * graph just for a date key (B-02).
+ */
+export function checkinDayKey(now: Date = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/**
+ * The Buddy and Qoder providers the daily check-in claims a credit for.
+ *
+ * Derived from the shared buddy family set plus the Qoder check-in list, the
+ * same shape as `buddy-checkin.ts`'s `DAILY_CHECKIN_PROVIDER_IDS`. Kept local
+ * so this worker module does not statically import the heavy buddy/qoder
+ * graphs for a constant id list (B-02).
+ */
+const QODER_CHECKIN_PROVIDER_IDS: readonly string[] = ["qoder", "qodercn"];
+export const DAILY_CHECKIN_PROVIDER_IDS: readonly string[] = [
+  ...BUDDY_PROVIDER_IDS,
+  ...QODER_CHECKIN_PROVIDER_IDS,
+];
 
 /**
  * Pending check-in requests handed to the sweep by a caller outside it.
@@ -270,6 +289,38 @@ export async function markCheckinAttempted(args: {
  * An account absent from the result was not attempted, matching the single
  * read's "absent means unknown, never claimed".
  */
+/**
+ * Shared Redis marker read. One `MGET` when the client supports it; otherwise
+ * (a minimal double, or a client without the command) a `GET` loop. Returns
+ * `undefined` when the ledger is unreadable — unknown, never "not claimed".
+ */
+async function readRedisMarkers(
+  redis: RedisClient,
+  dayKey: string,
+  accountIds: readonly string[],
+): Promise<Map<string, boolean> | undefined> {
+  const attempted = new Map<string, boolean>();
+  try {
+    if (typeof redis.mget === "function") {
+      // One command for every account: one key per account is small, and a
+      // single `MGET` keeps the cost flat instead of linear in the count.
+      const values = await redis.mget(
+        ...accountIds.map((id) => ledgerKey(dayKey, id)),
+      );
+      accountIds.forEach((accountId, index) => {
+        attempted.set(accountId, values[index] != null);
+      });
+      return attempted;
+    }
+    for (const accountId of accountIds) {
+      attempted.set(accountId, (await redis.get(ledgerKey(dayKey, accountId))) !== null);
+    }
+    return attempted;
+  } catch {
+    return undefined;
+  }
+}
+
 export async function checkinAttemptedTodayBatch(args: {
   readonly db: CartethyiaDatabase | undefined;
   readonly redis: RedisClient | undefined;
@@ -279,23 +330,11 @@ export async function checkinAttemptedTodayBatch(args: {
   const attempted = new Map<string, boolean>();
   if (args.accountIds.length === 0) return attempted;
   const dayKey = checkinDayKey(args.now?.() ?? new Date());
-  // A client without MGET (the memory backend) takes the DB path below, or
-  // reports unknown when there is no DB either.
-  if (args.redis !== undefined && typeof args.redis.mget === "function") {
-    try {
-      // One command for every account: one key per account is small, and a
-      // single `MGET` keeps the cost flat instead of linear in the count.
-      const values = (await args.redis.mget(
-        ...args.accountIds.map((id) => ledgerKey(dayKey, id)),
-      )) as Array<string | null>;
-      args.accountIds.forEach((accountId, index) => {
-        attempted.set(accountId, values[index] != null);
-      });
-      return attempted;
-    } catch {
-      // Fall through: an unreadable ledger means unknown, and the DB path is
-      // the only other place the marker could be.
-    }
+  if (args.redis !== undefined) {
+    const fromRedis = await readRedisMarkers(args.redis, dayKey, args.accountIds);
+    if (fromRedis !== undefined) return fromRedis;
+    // Fall through: an unreadable ledger means unknown, and the DB path is
+    // the only other place the marker could be.
   }
   if (args.db === undefined) return attempted;
   try {
@@ -326,11 +365,8 @@ export async function checkinAttemptedToday(args: {
 }): Promise<boolean> {
   const dayKey = checkinDayKey(args.now?.() ?? new Date());
   if (args.redis !== undefined) {
-    try {
-      return (await args.redis.get(ledgerKey(dayKey, args.accountId))) !== null;
-    } catch {
-      return false;
-    }
+    const fromRedis = await readRedisMarkers(args.redis, dayKey, [args.accountId]);
+    if (fromRedis !== undefined) return fromRedis.get(args.accountId) ?? false;
   }
   if (args.db === undefined) return false;
   try {
@@ -384,7 +420,7 @@ export function withDirectFallback(fetcher: typeof fetch): typeof fetch {
  * (`buddy-activity-report`) with its own ledger, so it is not re-POSTed on
  * every sweep. See `buddy-growth-tasks.ts`.
  */
-export type DailyGrowthPassResult = {
+type DailyGrowthPassResult = {
   readonly checkin: DailyCheckinResult;
 };
 
@@ -428,20 +464,37 @@ export async function attemptDailyGrowthPass(args: {
   }
   let checkin: DailyCheckinResult;
   try {
-    checkin = isQoderCheckinProvider(String(providerId))
-      ? await fetchQoderDailyCheckin({
-          providerId: String(providerId),
-          accountId,
-          credential,
-          fetcher,
-          ...(db ? { nativeIdentityStore: new DrizzleQoderNativeIdentityStore(db) } : {}),
-        })
-      : await fetchDailyCheckin({
-          providerId,
-          accountId,
-          credential,
-          fetcher,
-        });
+    // The buddy/qoder check-in graphs are lazy-loaded: only the provider on
+    // this account needs its surface, and neither should sit on the boot graph
+    // (B-02).
+    const isQoderCheckinProvider = (
+      await import("../providers/integrations/qoder/qoder-checkin")
+    ).isQoderCheckinProvider;
+    if (isQoderCheckinProvider(String(providerId))) {
+      const { fetchQoderDailyCheckin } = await import(
+        "../providers/integrations/qoder/qoder-checkin"
+      );
+      const { DrizzleQoderNativeIdentityStore } = await import(
+        "../providers/integrations/qoder/qoder-native-identity-store"
+      );
+      checkin = await fetchQoderDailyCheckin({
+        providerId: String(providerId),
+        accountId,
+        credential,
+        fetcher,
+        ...(db ? { nativeIdentityStore: new DrizzleQoderNativeIdentityStore(db) } : {}),
+      });
+    } else {
+      const { fetchDailyCheckin } = await import(
+        "../providers/integrations/buddy/buddy-checkin"
+      );
+      checkin = await fetchDailyCheckin({
+        providerId,
+        accountId,
+        credential,
+        fetcher,
+      });
+    }
   } catch (error) {
     checkin = {
       providerId,

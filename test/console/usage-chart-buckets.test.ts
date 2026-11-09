@@ -1,5 +1,5 @@
 /**
- * The usage chart endpoint (`/api/usage/range`).
+ * The usage chart endpoint (`/console/api/system/usage/chart?period=24h`).
  *
  * The "Requests" series counts completions per bucket; the "Cached" series
  * counts the cached share of the prompt, not all input. This pins both series
@@ -15,7 +15,7 @@ dbDescribe("usage chart buckets", () => {
     const world = await createWorld({ apiKeyOptions: { scopes: ["dashboard:read"] } });
     const gateway = await createTestGateway();
     try {
-      gateway.serveWorld(world);
+      await gateway.serveWorld(world);
       // The console mounts under /console/api and the chart takes a `period`
       // token (`24h`, `7d`, `all`), not explicit start/end/points bounds.
       const response = await gateway.request(

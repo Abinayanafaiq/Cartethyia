@@ -15,7 +15,7 @@ import { fetchProviderQuota } from "./quota-support";
 import { type FetchLike, type ProviderQuotaResult } from "./quota-contracts";
 import type { ProviderId } from "../provider-contracts";
 import type { ProviderRegistry } from "../provider-registry";
-import { GLOBAL_QUOTA_LENS, setCachedQuota } from "./cache";
+import { quotaLens, setCachedQuota } from "./cache";
 import { persistQuotaSnapshot } from "./snapshot";
 import { asJsonbRecord } from "../../shared/coerce";
 import { KIRO_DEFAULT_LABELS } from "../integrations/kiro/kiro-oauth";
@@ -65,7 +65,7 @@ export interface QuotaRefreshDeps {
    */
   readonly resolveCredential: (providerId: ProviderId, accountId: string) => Promise<string>;
   /** Marks a stored api_key credential with the upstream-distinguishable envelope. */
-  readonly markApiKeyCredential?: (providerId: string, credential: string) => string;
+  readonly markApiKeyCredential?: (providerId: string, credential: string) => Promise<string>;
   /** Invalidates the route snapshot when a stamped figure may exclude an account. */
   readonly snapshotInvalidator?: { invalidate(): unknown } | undefined;
 }
@@ -232,7 +232,7 @@ export interface QuotaRefreshTarget {
 
 /** Cache lens an account's quota belongs under. */
 export function targetLens(target: QuotaRefreshTarget): string {
-  return target.tenantId ?? GLOBAL_QUOTA_LENS;
+  return quotaLens(target.tenantId);
 }
 
 const TARGET_COLUMNS = {
@@ -365,7 +365,7 @@ async function runQuotaRefresh(
     // collector to the key-only probe, and OAuth credentials carry no key.
     const marked =
       target.credentialKind === "api_key"
-        ? (deps.markApiKeyCredential?.(target.providerId, credential) ?? credential)
+        ? (await deps.markApiKeyCredential?.(target.providerId, credential) ?? credential)
         : credential;
     try {
       const authState = asJsonbRecord(target.authState);

@@ -8,7 +8,7 @@ import type {
   TelemetryPayloadDepth,
   TelemetryPayloadMode,
 } from "../console/settings/contracts";
-export type CaptureScope = "tenant" | "debug_session" | "operator_flag";
+type CaptureScope = "tenant" | "debug_session" | "operator_flag";
 
 /**
  * How long a captured payload frame lives when the deployment has not chosen.
@@ -203,13 +203,13 @@ export interface PayloadCaptureInput {
   operatorFlagOptIn?: boolean;
 }
 
-export interface PayloadSignals {
+interface PayloadSignals {
   readonly toolCalls: number;
   readonly images: number;
   readonly attachments: number;
 }
 
-export interface StoredPayload {
+interface StoredPayload {
   id: string;
   /**
    * JSON text of the five body surfaces, in drawer order, built while the
@@ -412,8 +412,9 @@ export function buildPayloadRecord(
 
 /**
  * Postgres-backed redacted request/response payload capture. Payloads live for
- * the tenant's chosen retention — 15 minutes by default — and are pruned by the
- * sweep.
+ * the tenant's chosen retention — an hour by default (see
+ * {@link payloadRetentionMs} / `DEFAULT_PAYLOAD_RETENTION_MS`) — and are pruned
+ * by the sweep.
 
  */
 export class TelemetryPayloadCapture {

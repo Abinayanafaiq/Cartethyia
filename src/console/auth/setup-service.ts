@@ -20,6 +20,7 @@ import {
 import { resolveDefaultGatewayApiKey } from "../../config/runtime";
 import { TENANT_KEY_SCOPES } from "../../security/access-control";
 import { isRecord } from "../../protocol/codecs";
+import { asConsoleDb } from "../shared/transaction";
 import { BackupService } from "../backup/service";
 import type { BackupInspection } from "../backup/service";
 import type { RestoreWarning } from "../backup/contracts";
@@ -28,14 +29,14 @@ import type { RestoreWarning } from "../backup/contracts";
 // and the mode is read from the environment the process was started with.
 
 /** The administrator to create when a restored backup left none to sign in with. */
-export interface AdminBootstrap {
+interface AdminBootstrap {
   readonly password: string;
   readonly username?: string;
   readonly displayName?: string;
 }
 
 /** What a first-boot restore did, so the console can report it honestly. */
-export interface RestoreBackupOutcome {
+interface RestoreBackupOutcome {
   readonly restored: Record<string, number>;
   readonly skipped: Record<string, number>;
   /** Parts of the file that could not be restored. */
@@ -171,7 +172,7 @@ export class FirstBootSetupService {
     // unserialized lets two boots both pass the check.
     await this.db.transaction(async (transaction) => {
       await transaction.execute(firstBootSetupLock());
-      await create(transaction as unknown as CartethyiaDatabase);
+      await create(asConsoleDb(transaction));
     });
   }
 

@@ -92,11 +92,18 @@ export function assertWireFamily(
   );
 }
 
-/** Fetch capability that validates DNS answers and redirects before each request. */
-export type ValidatedOutboundFetch = (
+/**
+ * Minimal fetch surface accepted by provider adapters, collectors, and
+ * discovery paths. One canonical shape shared across modules that plug a
+ * transport into a provider boundary.
+ */
+export type OutboundFetch = (
   input: RequestInfo | URL,
   init?: RequestInit,
 ) => Promise<Response>;
+
+/** Fetch capability that validates DNS answers and redirects before each request. */
+export type ValidatedOutboundFetch = OutboundFetch;
 
 /** Provider WebSocket session over validated WSS egress. */
 export interface ProviderWebSocketSession {
@@ -261,6 +268,8 @@ export interface ProviderDispatchTarget {
   readonly endpoint_path: string;
   readonly output_limit?: number | null;
   readonly capabilities: Readonly<Record<string, boolean>>;
+  /** Explicit wire dialect (from `models.dialect`), when set. Absent = resolver fallback. */
+  readonly dialect?: string;
 }
 
 /** Provider adapter boundary: canonical request/events in, no public HTTP routes. */
@@ -272,11 +281,13 @@ export interface ProviderAdapter {
     context: ProviderDispatchContext,
   ): AsyncIterable<CanonicalEvent>;
   /**
-   * Optional native-protocol capability. A provider whose catalog serves a
-   * non-`llm` service kind (System One) implements the matching method; the
-   * native route handler looks it up and dispatches the caller's opaque body
-   * through it. The body is forwarded untouched — the method only adds the
-   * provider's auth/identity headers and posts it to `endpoint_path`.
+   * Optional native-protocol capability for the public `POST /v1/systemone`
+   * route (the dispatch leg of the System One service, alongside the probing
+   * leg served by the discovery/probing-service). A provider whose catalog
+   * serves a non-`llm` service kind (System One) implements the matching
+   * method; the native route handler looks it up and dispatches the caller's
+   * opaque body through it. The body is forwarded untouched — the method only
+   * adds the provider's auth/identity headers and posts it to `endpoint_path`.
    *
    * An adapter without this method is simply not eligible for the route, which
    * is why it is optional rather than a required no-op.

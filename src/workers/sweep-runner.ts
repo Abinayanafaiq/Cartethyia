@@ -17,12 +17,30 @@
  * wrapper; this module owns only the domain lifecycle above.
  */
 import { log } from "../observability/logger";
+import { foregroundBusy } from "../shared/invoke-guard";
 import { runGrowingWaves } from "./scheduler";
 
-export const DEFAULT_SWEEP_CONCURRENCY = 5;
+const DEFAULT_SWEEP_CONCURRENCY = 5;
+
+/**
+ * How long a wave boundary waits for foreground activity to clear before
+ * starting the next wave (G-03). A bounded courtesy pause — never a skip: if
+ * the foreground stays busy past this window the sweep proceeds, because a
+ * sweep starved forever is worse than one sharing a tick with the page.
+ */
+const FOREGROUND_DEFER_WAVE_MAX_MS = 1_000;
+
+/** Pause between waves while foreground activity is busy, bounded. */
+async function deferWaveForForeground(now: () => number): Promise<void> {
+  if (!foregroundBusy()) return;
+  const until = now() + FOREGROUND_DEFER_WAVE_MAX_MS;
+  while (foregroundBusy() && now() < until) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
 
 /** Outcome counts for one sweep pass. */
-export interface SweepResult {
+interface SweepResult {
   /** Targets the lister returned. */
   readonly listed: number;
   /** Targets dropped before the run: no refresher, not due, or over the cap. */
@@ -41,7 +59,7 @@ export interface SweepResult {
 }
 
 /** What `select` returns: the batch to run, plus any extra drops it made. */
-export interface SweepSelection<T> {
+interface SweepSelection<T> {
   readonly batch: readonly T[];
   /**
    * Targets dropped by selection itself (stale cache, over the per-pass cap).
@@ -51,7 +69,7 @@ export interface SweepSelection<T> {
 }
 
 /** One sweep's domain hooks. */
-export interface SweepPlan<T> {
+interface SweepPlan<T> {
   /** Log prefix, e.g. `quota-refresh`. */
   readonly name: string;
   /** Lists candidate targets. A rejection is logged and yields an empty pass. */
@@ -96,7 +114,7 @@ export interface SweepPlan<T> {
 }
 
 /** The counts a pass that never got off the ground reports. */
-export const EMPTY_SWEEP_RESULT: SweepResult = {
+const EMPTY_SWEEP_RESULT: SweepResult = {
   listed: 0,
   skipped: 0,
   attempted: 0,
@@ -173,6 +191,7 @@ export async function runSweep<T>(plan: SweepPlan<T>): Promise<SweepResult> {
     await runGrowingWaves(batch, {
       maxConcurrency: Math.max(1, plan.maxConcurrency ?? DEFAULT_SWEEP_CONCURRENCY),
       ...(deadline === null ? {} : { shouldStop: () => now() >= (deadline as number) }),
+      beforeWave: () => deferWaveForForeground(now),
       onItem: runOne,
     });
   }

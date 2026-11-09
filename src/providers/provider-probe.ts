@@ -12,6 +12,7 @@
  * report a pool as refused for a reason replacing the proxy cannot fix.
  */
 import { encodeWireRequest } from "../protocol/registry";
+import { resolveDialect } from "../protocol/translation/dialect/resolver";
 import type { CanonicalRequest } from "../protocol/canonical-model";
 import type { ProviderDispatchContext } from "./provider-contracts";
 import { providerBaseUrl, providerRateLimitIsIpScoped } from "./provider-metadata";
@@ -60,7 +61,7 @@ function probeRequest(): CanonicalRequest {
     stream: true,
     source_surface: "chat",
     generation_controls: {},
-  } as unknown as CanonicalRequest;
+  };
 }
 
 /**
@@ -98,6 +99,7 @@ export async function buildProviderProbeRequest(
     ...(spec.chatTokenLimitField === undefined
       ? {}
       : { chatTokenLimitField: spec.chatTokenLimitField }),
+    dialectPolicy: resolveDialect(PROBE_MODEL, providerId, "chat"),
   });
   // The adapter's own hooks build the wire body; without running them the
   // probe would omit the agent-tool fingerprint and be refused on a healthy
@@ -116,7 +118,7 @@ export async function buildProviderProbeRequest(
   );
   const headers = (await spec.buildExtraHeaders?.(probeContext(providerId), source)) ?? {};
   return {
-    url: `${providerBaseUrl(providerId).replace(/\/+$/, "")}/inference/openai/v1/chat/completions`,
+    url: `${providerBaseUrl(providerId)}/inference/openai/v1/chat/completions`,
     headers: { "content-type": "application/json", ...headers },
     body: payload,
   };

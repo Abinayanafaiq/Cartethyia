@@ -20,12 +20,12 @@ import {
 import { DEFAULT_PROVIDER_MAX_INFLIGHT } from "../../persistence/schema";
 import { resolveTenantOverride } from "../../persistence/tenant-scope";
 import {
-  type RouteCandidate,
   type ComboDefinition,
   type PoolRoutingSetting,
   type ProviderRoutingMap,
   type RouteSnapshot,
   type SnapshotBuilder,
+  type RoutedCandidate,
 } from "./route-model";
 import { DEFAULT_PROXY_SKIP_PROVIDER_IDS } from "../../providers/provider-metadata";
 import { buildClaudeCliUserAgent } from "../../providers/operations/custom-cli-headers";
@@ -83,18 +83,6 @@ export function cliMappingSourceKeys(toolId: string, sourceModel: string): reado
  * owned by that exact same tenant, and its candidates carry that tenant id
  * — `RoutingEngine.plan()` filters candidates by the requesting tenant.
  */
-
-type RouteCandidateWithHealth = RouteCandidate & {
-  health_status?: "cooldown" | "model_cooldown" | "disabled";
-  cooldown_kind?: "hard" | "soft";
-  /**
-   * Epoch milliseconds at which this candidate's cooling window ends, when one
-   * is in force. Routing-internal: it is what lets `plan()` report a real reset
-   * on the all-accounts-cooling answer, and it never reaches a client verbatim —
-   * only the derived `retry-after` does.
-   */
-  cooldown_until?: number;
-};
 
 const HARD_COOLDOWN_CATEGORIES: Readonly<Record<string, true>> = {
   quota_exhausted: true,
@@ -246,6 +234,7 @@ interface MergedModelRow {
   providerId: string;
   modelId: string;
   wireFamily: WireFamily;
+  dialect?: string | null;
   serviceKind: ServiceKind;
   endpointPath: string;
   modalities: unknown;
@@ -270,6 +259,7 @@ function mergeModelCatalog(
       providerId: row.providerId,
       modelId: row.modelId,
       wireFamily: row.wireFamily as WireFamily,
+      ...(row.dialect === null ? {} : { dialect: row.dialect }),
       serviceKind: row.serviceKind as ServiceKind,
       endpointPath: row.endpointPath,
       modalities: row.modalities,
@@ -309,6 +299,7 @@ const MODEL_COLUMNS = {
   providerId: models.providerId,
   modelId: models.modelId,
   wireFamily: models.wireFamily,
+  dialect: models.dialect,
   serviceKind: models.serviceKind,
   endpointPath: models.endpointPath,
   modalities: models.modalities,
@@ -678,7 +669,7 @@ class RouteCatalogRepository {
       accountsByProvider.set(account.providerId, list);
     }
 
-    const candidates: RouteCandidateWithHealth[] = [];
+    const candidates: RoutedCandidate[] = [];
     for (const model of mergedModelRows) {
       const providerTenantId = providerTenantById.get(model.providerId);
       if (providerTenantId === undefined) continue;
@@ -717,10 +708,11 @@ class RouteCatalogRepository {
               const tenantPools = resolveNetworkPools(model.providerId, tenantOwnerId);
               if (!tenantPools) continue;
               emittedPoolAccount = true;
-              const tenantCandidate: RouteCandidateWithHealth = {
+              const tenantCandidate: RoutedCandidate = {
                 provider_id: model.providerId,
                 model_id: model.modelId,
                 wire_family: model.wireFamily as WireFamily,
+                ...(model.dialect == null ? {} : { dialect: model.dialect }),
                 service_kind: model.serviceKind,
                 endpoint: model.endpointPath,
                 ...(model.outputLimit == null ? {} : { output_limit: model.outputLimit }),
@@ -757,10 +749,11 @@ class RouteCatalogRepository {
           for (const tId of configuredPoolTenants) {
             const tenantPools = resolveNetworkPools(model.providerId, tId);
             if (tenantPools) {
-              const tenantCandidate: RouteCandidateWithHealth = {
+              const tenantCandidate: RoutedCandidate = {
                 provider_id: model.providerId,
                 model_id: model.modelId,
                 wire_family: model.wireFamily as WireFamily,
+                ...(model.dialect == null ? {} : { dialect: model.dialect }),
                 service_kind: model.serviceKind,
                 endpoint: model.endpointPath,
                 ...(model.outputLimit == null ? {} : { output_limit: model.outputLimit }),
@@ -786,10 +779,11 @@ class RouteCatalogRepository {
         const networkPools = providerRequiresAccount
           ? undefined
           : resolveNetworkPools(model.providerId, providerTenantId);
-        const candidate: RouteCandidateWithHealth = {
+        const candidate: RoutedCandidate = {
           provider_id: model.providerId,
           model_id: model.modelId,
           wire_family: model.wireFamily as WireFamily,
+          ...(model.dialect == null ? {} : { dialect: model.dialect }),
           service_kind: model.serviceKind,
           endpoint: model.endpointPath,
           ...(model.outputLimit == null ? {} : { output_limit: model.outputLimit }),
@@ -829,10 +823,11 @@ class RouteCatalogRepository {
         }
         const networkPools = resolveNetworkPools(model.providerId, rowTenantId);
         const routeUserAgent = resolveUserAgent(model.providerId, rowTenantId);
-        const candidate: RouteCandidateWithHealth = {
+        const candidate: RoutedCandidate = {
           provider_id: model.providerId,
           model_id: model.modelId,
           wire_family: model.wireFamily as WireFamily,
+          ...(model.dialect == null ? {} : { dialect: model.dialect }),
           service_kind: model.serviceKind,
           endpoint: model.endpointPath,
           ...(model.outputLimit == null ? {} : { output_limit: model.outputLimit }),

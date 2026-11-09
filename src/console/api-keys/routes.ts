@@ -20,6 +20,7 @@ import type {
   SharedChildrenPageOptions,
 } from "../../persistence/stores/api-key-store";
 import {
+  API_KEY_BAN_REASONS,
   BAN_DURATION_CHOICES,
   DEFAULT_BAN_MINUTES,
   generateApiKeySecret,
@@ -40,6 +41,7 @@ import {
 } from "./contracts";
 import type { SharedKeyActivityDetail, SharedKeySummary } from "../share/share-usage";
 import { popupImageBytes } from "./share-popup-image";
+import { log } from "../../observability/logger";
 
 const SHARED_CHILD_SORT_COLUMNS = new Set<SharedChildSortColumn>([
   "createdAt",
@@ -49,6 +51,9 @@ const SHARED_CHILD_SORT_COLUMNS = new Set<SharedChildSortColumn>([
   "revokedAt",
   "enabled",
 ]);
+
+/** The offered ban durations as a set of minute values, hoisted once. */
+const BAN_DURATION_MINUTES = new Set(BAN_DURATION_CHOICES.map((choice) => choice.minutes));
 
 /** Parses and bounds the paginated share-child list query. */
 function parseSharedChildrenQuery(query: URLSearchParams): SharedChildrenPageOptions {
@@ -95,7 +100,16 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
             if (record.keyMode !== "share") return response;
             const family = await config.store
               .sumFamilyTelemetryConsumed(authorized.tenantId, record.id)
-              .catch(() => 0);
+              .catch((error) => {
+                // A failed sum must not fail the whole list, but it must not
+                // be silent either: reporting the share template's spend as 0
+                // under-reports consumed tokens in the console list.
+                log.warn(
+                  `[api-keys] sumFamilyTelemetryConsumed failed for key ${record.id}; reporting 0`,
+                  error as Error,
+                );
+                return 0;
+              });
             return { ...response, tokensConsumed: response.tokensConsumed + family };
           }),
         );
@@ -793,8 +807,7 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
       // clamping would answer a request for 90 days with a week and report
       // success.
       const chosenMinutes = request.minutes === undefined ? DEFAULT_BAN_MINUTES : request.minutes;
-      const allowed = new Set(BAN_DURATION_CHOICES.map((choice) => choice.minutes));
-      if (!allowed.has(chosenMinutes)) {
+      if (!BAN_DURATION_MINUTES.has(chosenMinutes)) {
         throw new ConsoleDomainError(
           "invalid_request",
           400,
@@ -816,11 +829,27 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
         access: authorized,
         action: "api_key.banned",
         target: keyId,
-        detail: { reason, ...(bannedUntil === null ? { permanent: true } : { bannedUntil: bannedUntil.toISOString() }) },
+        detail: {
+          reason,
+          // The human-readable label is derived server-side from the machine
+          // `reason`, so the audit trail cannot be skewed by a client-authored
+          // label. Unknown reasons (custom text) simply carry no label; the
+          // free-text `reason` above is still recorded verbatim.
+          ...(API_KEY_BAN_REASONS.find((r) => r.value === reason)?.label === undefined
+            ? {}
+            : { reasonLabel: API_KEY_BAN_REASONS.find((r) => r.value === reason)!.label }),
+          ...(bannedUntil === null ? { permanent: true } : { bannedUntil: bannedUntil.toISOString() }),
+        },
       });
-      const record = await config.store.get(authorized.tenantId, keyId);
-      if (!record) throw new ConsoleDomainError("key_not_found", 404, "Key not found");
-      return sanitizeApiKeyResponse(record);
+      // The ban mutates the row already fetched; derive the response from that
+      // record instead of re-fetching after the write. Match the store's own
+      // mapping: a `null` (permanent) `bannedUntil` is omitted, not carried.
+      return sanitizeApiKeyResponse({
+        ...current,
+        bannedAt: new Date(),
+        banReason: reason,
+        ...(bannedUntil ? { bannedUntil } : {}),
+      });
     },
     async unbanKey(
       access: AccessDecision | undefined,
@@ -838,9 +867,11 @@ export function createApiKeyOperations(config: ApiKeyConfig) {
         action: "api_key.unbanned",
         target: keyId,
       });
-      const record = await config.store.get(authorized.tenantId, keyId);
-      if (!record) throw new ConsoleDomainError("key_not_found", 404, "Key not found");
-      return sanitizeApiKeyResponse(record);
+      // Unban clears all three ban columns and re-enables the key; derive the
+      // response from the pre-fetch instead of re-fetching after the write.
+      const { bannedAt: _bannedAt, banReason: _banReason, bannedUntil: _bannedUntil, ...currentRest } = current;
+      const unbannedRecord: ApiKeyRecord = { ...currentRest, enabled: true };
+      return sanitizeApiKeyResponse(unbannedRecord);
     },
   };
   return operations;
@@ -1023,7 +1054,9 @@ export function createApiKeyRoutes(config: ApiKeyConfig): AnyElysia {
       {
         body: t.Object({
           reason: t.String(),
-          reasonLabel: t.Optional(t.String()),
+          // `reasonLabel` is deliberately not accepted: the audit label is
+          // derived server-side from `reason` (see `banKey`), so a client
+          // cannot author the human-readable audit entry.
           minutes: t.Optional(t.Union([t.Number({ minimum: 1 }), t.Null()])),
         }),
       },

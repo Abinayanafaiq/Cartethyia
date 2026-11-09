@@ -105,6 +105,23 @@ export function invalidateCredentialCache(accountId?: string): void {
   }
 }
 
+/**
+ * Invalidates many accounts' cached credentials in one pass over the cache.
+ *
+ * The batch-delete route deletes several accounts at once; calling the single
+ * variant per id would scan the whole cache once per account. This is one
+ * scan with a suffix set, so the cost is one pass regardless of batch size.
+ */
+export function invalidateCredentialCaches(accountIds: readonly string[]): void {
+  if (accountIds.length === 0) return;
+  const suffixes = new Set(accountIds.map((id) => `:${id}`));
+  for (const key of credCache.keys()) {
+    // Account ids are globally unique and contain no colon, so the trailing
+    // `:${accountId}` segment uniquely identifies the owning account.
+    if (suffixes.has(key.slice(key.lastIndexOf(":")))) credCache.delete(key);
+  }
+}
+
 const resolver = new CredentialResolver();
 
 /** Stored account fields needed by credential resolution and token refresh. */
@@ -295,7 +312,7 @@ export async function resolveCredentialForAccount(
   return value;
 }
 
-export async function resolveAccountSecretString(
+async function resolveAccountSecretString(
   db: CartethyiaDatabase,
   providerId: string,
   accountId: string,
@@ -306,7 +323,7 @@ export async function resolveAccountSecretString(
 }
 
 /** Decrypts the stored provider tokens after refreshing an expired OAuth access token. */
-export async function resolveAccountCredentialsForExport(
+async function resolveAccountCredentialsForExport(
   db: CartethyiaDatabase,
   providerId: string,
   accountId: string,

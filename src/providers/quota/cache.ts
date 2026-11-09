@@ -319,31 +319,31 @@ export async function invalidateQuotaCache(
 }
 
 /**
- * Drops one account from EVERY cache lens. Global accounts are shared, but a
- * release-N writer may have written the same account under a per-tenant lens,
- * so a global mutation clears all of them rather than assuming which lens this
- * instance last wrote. Release N+1 collapses this to a single `del` once every
- * writer goes through `quotaLens()` and no per-tenant copy can exist.
+ * Drops many accounts from one lens in a single pass.
+ *
+ * The batch-delete route clears several accounts' quota caches at once. The
+ * in-process tier is swept once (one `keys()` pass), and Redis is cleared with
+ * one pipeline, so the cost does not scale with per-account round trips.
  */
-export async function invalidateQuotaCacheForAccount(
-  accountId: string,
+export async function invalidateQuotaCaches(
+  lens: string,
+  accountIds: readonly string[],
   redis: RedisClient | undefined,
 ): Promise<void> {
-  const suffix = `:${accountId}`;
+  if (accountIds.length === 0) return;
+  const keys = accountIds.map((accountId) => quotaKey(lens, accountId));
+  const keySet = new Set(keys);
   for (const key of inMemoryQuotaCache.keys()) {
-    if (key.endsWith(suffix)) inMemoryQuotaCache.delete(key);
+    if (keySet.has(key)) inMemoryQuotaCache.delete(key);
   }
   if (redis === undefined) return;
   try {
-    let cursor = "0";
-    do {
-      const [next, keys] = await redis.scan(cursor, "MATCH", `${QUOTA_KEY_PREFIX}*${suffix}`, "COUNT", 500);
-      cursor = next;
-      if (keys.length > 0) await redis.del(...keys);
-    } while (cursor !== "0");
+    const pipeline = redis.pipeline();
+    for (const key of keys) pipeline.del(key);
+    await pipeline.exec().catch(() => undefined);
   } catch (error) {
     metrics.quota_cache_invalidate_failed.inc(1);
-    log.warn("quota cache invalidate-all failed", { accountId, error: String(error) });
+    log.warn("quota cache batch invalidate failed", { lens, error: String(error) });
   }
 }
 

@@ -2,6 +2,8 @@
 import { GatewayError } from "../../protocol/gateway-error";
 import { type ServiceKind, type WireFamily } from "../../protocol/canonical-model";
 import type { CallerIdentity } from "../../security/access-control";
+import type { ProviderQuotaWindow } from "../../providers/quota/quota-contracts";
+import { log } from "../../observability/logger";
 
 export type { CallerIdentity };
 
@@ -14,6 +16,8 @@ export interface RouteCandidate {
   readonly provider_id: string;
   readonly model_id: string;
   readonly wire_family: WireFamily;
+  /** Explicit wire dialect (from `models.dialect`), when set. Absent = resolver fallback. */
+  readonly dialect?: string;
   /**
    * Protocol shape of the model. `llm` (the default) flows through the
    * canonical surface pipeline; a non-`llm` model is dispatched by its native
@@ -101,8 +105,41 @@ export interface RouteCandidate {
   readonly usage_floor?: number;
   readonly usage_floor_unit?: "credit" | "percent";
   /** Live quota windows (cache) the floor check evaluates. */
-  readonly quota_windows?: readonly unknown[];
+  readonly quota_windows?: readonly ProviderQuotaWindow[];
 }
+
+/**
+ * A candidate as the routing engine actually evaluates it: the catalog fields
+ * above plus the health/cooling stamp `route-catalog.ts` projects onto it and
+ * the plan-time slow-lane marker.
+ *
+ * Declared here — not as a route-catalog-local intersection — so
+ * `EligibilityEvaluator.evaluate` can take the routed shape without a cast,
+ * and so every stamping site agrees on the same field set by construction.
+ */
+export type RoutedCandidate = RouteCandidate & {
+  /**
+   * Health marker the catalog projects from `provider_accounts.status` and
+   * unexpired `model_cooldowns` entries. Absent = no health exclusion known.
+   * Mutable by declaration: the catalog builds the base candidate first and
+   * stamps health/cooling onto it as account rows are walked.
+   */
+  health_status?: "cooldown" | "model_cooldown" | "disabled";
+  /** Cooldown class the catalog derives from the account's last error category. */
+  cooldown_kind?: "hard" | "soft";
+  /**
+   * Epoch milliseconds at which this candidate's cooling window ends, when one
+   * is in force. Routing-internal: it is what lets `plan()` report a real reset
+   * on the all-accounts-cooling answer, and it never reaches a client verbatim —
+   * only the derived `retry-after` does.
+   */
+  cooldown_until?: number;
+  /**
+   * Slow-lane stamp applied at plan time (test-supported; runtime slow-lane
+   * activity is read live via `sharedClaudeSlowLanes.isActive`).
+   */
+  lane?: "slow";
+};
 
 /**
  * Provider-routing strategies. The runtime tuple is the source: the console's
@@ -276,7 +313,6 @@ export type EligibilityReason =
   | "cooldown_hard"
   | "model_cooldown"
   | "quota_exhausted"
-  | "locked"
   | "disabled"
 
 export interface EligibilityDecision {
@@ -286,7 +322,7 @@ export interface EligibilityDecision {
   /**
    * Epoch milliseconds at which this candidate's cooling window ends, when the
    * exclusion that produced this decision carries one. Absent for a healthy
-   * candidate and for every reason with no deadline (`disabled`, `locked`,
+   * candidate and for every reason with no deadline (`disabled`,
    * `quota_exhausted` from spent windows or the usage floor). `plan()` takes the
    * minimum across the cooling set to report the earliest reset a client could
    * retry against.
@@ -334,7 +370,7 @@ export interface AdmissionController {
  * Translates the evaluator's internal reason codes into operator English.
  *
  * These names are the vocabulary the routing layers use with each other —
- * `model_cooldown`, `cooldown_hard`, `locked` — not something to print into the
+ * `model_cooldown`, `cooldown_hard` — not something to print into the
  * public message, where the client would read an enum instead of an
  * explanation. The codes stay in the envelope's `reasons` field for anyone who
  * wants them; the sentence carries what they mean.
@@ -348,7 +384,6 @@ const ELIGIBILITY_REASON_LABELS: Readonly<Record<string, string>> = {
   cooldown_hard: "every account is in a hard cooldown",
   cooldown: "accounts are cooling down",
   disabled: "all accounts are disabled",
-  locked: "all accounts are locked by another request",
   credit_floor_reached: "credit or quota is exhausted",
   quota_exhausted: "every account has an exhausted quota window or is below its configured usage floor",
   capability_unsupported: "the accounts serving this model do not support the request's capabilities (e.g. images, tools, or reasoning)",
@@ -395,15 +430,6 @@ export function modelNotFoundError(requested: string, resolved: readonly string[
   );
 }
 
-export function capabilityUnsupportedError(capability: string): GatewayError {
-  return new GatewayError(
-    "capability_unsupported",
-    400,
-    `No account serving this model supports ${capability} (request {requestId}). Drop the ${capability} part of the request, or route to a model that accepts it. Know your tools — this one just isn't in the box 🧰`,
-    { capability },
-  );
-}
-
 /**
  * Every candidate in the plan refused admission: each account is already
  * serving its configured max-inflight.
@@ -446,7 +472,7 @@ export function capacityExhaustedError(context?: {
 
 /**
  * The model exists and is routed, but every account serving it is currently
- * unusable (disabled / locked). This is transient and
+ * unusable (disabled). This is transient and
  * retry-able, so it must NOT surface as `model_not_found` — a 404 tells the
  * client to fix its request when the real fix is to wait or add capacity.
  *
@@ -551,42 +577,83 @@ export class InMemoryRouteSnapshotService implements RouteSnapshotService {
    * only populate the cache if no mutation happened while it ran.
    */
   private building: { revision: RoutingRevision; promise: Promise<RouteSnapshot> } | undefined;
+  /**
+   * Debounced background-rebuild timer (G-02). One invalidate schedules a
+   * rebuild; a burst of invalidates within `rebuildDebounceMs` coalesces into
+   * the single latest-revision rebuild. The timer is cleared on `stop()`.
+   */
+  private rebuildTimer: ReturnType<typeof setTimeout> | undefined;
+  private stopped = false;
 
-  constructor(private readonly builder: SnapshotBuilder) {
+  constructor(
+    private readonly builder: SnapshotBuilder,
+    options: { readonly rebuildDebounceMs?: number } = {},
+  ) {
+    this.rebuildDebounceMs = options.rebuildDebounceMs ?? 500;
     // Peers' mutations arrive once per process, not per instance: the handler
-    // drops this instance's copy, which is the only one there is.
+    // schedules a background rebuild, which is the only one there is.
     this.unsubscribe = subscribeRoutingInvalidation(() => {
       this.revision += 1;
-      this.snapshot = undefined;
+      this.scheduleRebuild();
     });
   }
 
-  /** Ends the peer-invalidation subscription. */
+  /** Ends the peer-invalidation subscription and clears the rebuild timer. */
   readonly unsubscribe: () => void;
 
-  async getSnapshot(): Promise<RouteSnapshot> {
-    if (this.snapshot) return this.snapshot;
-    if (this.building && this.building.revision === this.revision) return this.building.promise;
+  /** Wall-clock debounce for coalescing invalidate bursts. */
+  private readonly rebuildDebounceMs: number;
+
+  /**
+   * Schedules a background rebuild at the current revision. Debounced: while a
+   * timer is pending, further invalidates just bump the revision and the
+   * pending rebuild picks up the latest. Single-flight by construction — the
+   * rebuild itself reuses {@link building}, so concurrent callers share one
+   * promise for the same revision.
+   */
+  private scheduleRebuild(): void {
+    if (this.stopped || this.rebuildTimer !== undefined) return;
+    this.rebuildTimer = setTimeout(() => {
+      this.rebuildTimer = undefined;
+      void this.rebuildNow().catch((error: unknown) => {
+        // A background rebuild failure is a soft miss: requests served the
+        // last-completed snapshot, and the next invalidation retries.
+        log.warn("[route-snapshot] background rebuild failed", error as Error);
+      });
+    }, this.rebuildDebounceMs);
+    if (typeof this.rebuildTimer.unref === "function") this.rebuildTimer.unref();
+  }
+
+  /** Starts (or joins) the build for the current revision. */
+  private rebuildNow(): Promise<RouteSnapshot> {
     const revision = this.revision;
+    if (this.building && this.building.revision === revision) return this.building.promise;
     const promise = this.build(revision);
     this.building = { revision, promise };
-    try {
-      return await promise;
-    } finally {
+    void promise.finally(() => {
       // Only the build that is still current may clear the slot; a build
       // started after a mutation must not be dropped by an older one finishing.
       if (this.building?.promise === promise) this.building = undefined;
-    }
+    });
+    return promise;
   }
 
+  async getSnapshot(): Promise<RouteSnapshot> {
+    // G-02: serve the last-completed snapshot while a rebuild runs, so the
+    // page-open request path never pays the catalog build. Only a cold start
+    // (no snapshot at all) falls through to a synchronous build here.
+    if (this.snapshot) return this.snapshot;
+    return this.rebuildNow();
+  }
 
   async invalidate(): Promise<RoutingRevision> {
     this.revision += 1;
-    this.snapshot = undefined;
-    // Lazy: the next getSnapshot() rebuilds. Dashboard mutations only need
-    // the new revision token — they must not pay seven Postgres round-trips
-    // inside the mutating request while holding no pool pressure budget.
-    //
+    // G-02: trigger a BACKGROUND rebuild immediately instead of clearing the
+    // snapshot and making the next request pay. The rebuild is debounced so a
+    // burst of invalidates (a recovery sweep, a cascade of console writes)
+    // coalesces into one rebuild, and it never blocks the mutating request —
+    // a console write does not wait on its own rebuild here.
+    this.scheduleRebuild();
     // Broadcast, because `reusePort` runs several gateway processes and each
     // holds its own snapshot: a console write handled by one of them left the
     // others serving pre-write routing until something else invalidated them.
@@ -594,6 +661,15 @@ export class InMemoryRouteSnapshotService implements RouteSnapshotService {
     // notice carries no data, so there is nothing to deserialize.
     publishRoutingInvalidation();
     return this.revision;
+  }
+
+  /** Stops background rebuilds. Test/teardown helper. */
+  stop(): void {
+    this.stopped = true;
+    if (this.rebuildTimer !== undefined) {
+      clearTimeout(this.rebuildTimer);
+      this.rebuildTimer = undefined;
+    }
   }
 
   private async build(revision: RoutingRevision): Promise<RouteSnapshot> {

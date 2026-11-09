@@ -72,7 +72,7 @@ dbDescribe("vision handoff", () => {
       modelId: "vision-model",
       modelOptions: { wireFamily: "chat", endpointPath: "/v1/chat/completions" },
     });
-    gateway.setRoutes([
+    await gateway.setRoutes([
       // The main model is text-only: no image capability.
       {
         providerId: textOnly.providerId,
@@ -221,6 +221,16 @@ dbDescribe("vision handoff", () => {
     expect(
       activeTurn.content.some(
         (part) => part.kind === "text" && part.text.includes("Hello from Cartethyia"),
+      ),
+    ).toBe(true);
+    // The description is explicitly framed as the vision model's description of
+    // the attached image, so the main model does not treat it as user prose.
+    expect(
+      activeTurn.content.some(
+        (part) =>
+          part.kind === "text" &&
+          part.text.includes("A vision model described it for you") &&
+          part.text.includes("Hello from Cartethyia"),
       ),
     ).toBe(true);
   });

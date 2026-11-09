@@ -50,6 +50,7 @@ import {
   resolveProbeAdapter,
   resolveProbeTarget,
   selectProbeAccount,
+  selectUsableAccount,
   wireContextFrom,
   type ProbeProviderRow,
 } from "./probe-phases";
@@ -915,6 +916,9 @@ export class ProviderProbingService {
         source: discDef?.freeTier === true ? "auto_free" : "discovered",
         sourceUpdatedAt,
         enabled: true,
+        ...(discDef?.dialect === undefined && knownDefinition?.dialect === undefined
+          ? {}
+          : { dialect: discDef?.dialect ?? knownDefinition?.dialect }),
       });
     }
     // One statement per chunk (500, the account-health batch step) instead of
@@ -936,6 +940,7 @@ export class ProviderProbingService {
             cost: sql`excluded.cost`,
             proOnly: sql`excluded.pro_only`,
             freeTier: sql`excluded.free_tier`,
+            dialect: sql`excluded.dialect`,
             // The proposed row's own source, not a constant: a free-tier
             // discovery and an ordinary one write the same upsert, and pinning
             // this to `discovered` would relabel every free-tier row on the
@@ -1000,14 +1005,7 @@ export class ProviderProbingService {
           globalOrOwnedBy(providerAccounts.tenantId, tenantId),
         ),
       );
-    const now = Date.now();
-    const usable = rows
-      .filter(
-        (row) =>
-          row.status !== "disabled" &&
-          (row.cooldownUntil === null || row.cooldownUntil.getTime() <= now),
-      )
-      .sort((left, right) => Number(right.tenantId !== null) - Number(left.tenantId !== null))[0];
+    const usable = selectUsableAccount(rows);
     if (!usable?.credentialCiphertext) return undefined;
     const authState = isRecord(usable.authState) ? usable.authState as Readonly<Record<string, unknown>> : undefined;
     return {

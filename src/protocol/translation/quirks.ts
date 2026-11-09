@@ -32,7 +32,7 @@ export interface ParamQuirk {
 }
 
 /** Per-wire output-token policy, in one table instead of per-builder branches. */
-export interface WireTokenBound {
+interface WireTokenBound {
   /** Default when the caller sent no limit (undefined = leave absent). */
   readonly defaultMaxTokens?: number;
   /** Floor applied to any positive caller value below it (wire minimum). */
@@ -66,6 +66,13 @@ const DEFAULT_OUTPUT_TOKENS = 32_000;
  * Output-token bounds per wire family. Chat has no global ceiling: a model's
  * catalog output limit is the ceiling, and an unknown model passes the
  * caller's value through. Messages keeps its Anthropic floors and OAuth cap.
+ *
+ * The ceiling only ever comes from `options.maxOutputTokens` (the model's
+ * catalog output limit, supplied by the compatible adapter from
+ * `candidate.output_limit`). When it is omitted there is nothing to clamp to,
+ * which is intentional pass-through: a direct codec caller without a catalog
+ * limit is unbounded, and an unknown model passes the caller's value through by
+ * design — the bound table supplies floors/defaults, never an invented ceiling.
  */
 export const WIRE_TOKEN_BOUNDS: Readonly<Record<string, WireTokenBound>> = {
   chat: { minTokens: 16, defaultMaxTokens: DEFAULT_OUTPUT_TOKENS },
@@ -73,7 +80,14 @@ export const WIRE_TOKEN_BOUNDS: Readonly<Record<string, WireTokenBound>> = {
   responses: { minTokens: 16, defaultMaxTokens: DEFAULT_OUTPUT_TOKENS },
 };
 
-/** Resolves the output-token value for one wire from caller controls. */
+/**
+ * Resolves the output-token value for one wire from caller controls.
+ *
+ * Clamping to a ceiling happens only when `options.maxOutputTokens` (the
+ * model's catalog limit) is present. An omitted `maxOutputTokens` means
+ * pass-through by design: a direct codec caller without a catalog limit is
+ * unbounded, and this function never fabricates a ceiling on its own.
+ */
 export function resolveWireMaxTokens(
   wire: string,
   controls: { max_tokens?: number | undefined },
@@ -120,7 +134,7 @@ function modelGeneration(modelId: string): { family: string; major: number; mino
 }
 
 /** True when the model rejects `temperature`/`top_p`/`top_k` at any thinking setting. */
-export function rejectsSamplingParams(modelId: string): boolean {
+function rejectsSamplingParams(modelId: string): boolean {
   const generation = modelGeneration(modelId);
   if (generation === undefined) return false;
   // Opus turns strict at 4.7; the other families at 5.0.
@@ -157,7 +171,7 @@ const PARAM_QUIRKS: readonly ParamQuirk[] = [
 ];
 
 /** Finds the first quirk matching the provider/model pair, or undefined. */
-export function findParamQuirk(
+function findParamQuirk(
   providerId: string,
   modelId: string,
 ): ParamQuirk | undefined {

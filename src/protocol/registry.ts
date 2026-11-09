@@ -1,6 +1,8 @@
 import type { CanonicalEvent, CanonicalRequest, WireFamily } from "./canonical-model";
+import type { DialectPolicy } from "./translation/dialect/types";
+import type { ThinkingConfig } from "./translation/dialect/thinking-ladder";
 
-export interface CodecContext {
+interface CodecContext {
   readonly isOAuth?: boolean;
   readonly sessionId?: string;
   readonly supportsPromptCaching?: boolean;
@@ -13,6 +15,16 @@ export interface CodecContext {
    * deployment default; only wire encoders that clamp images read it.
    */
   readonly maxBytesOverride?: number;
+  /**
+   * Resolved wire dialect (see `translation/dialect`). Absent = the codec's
+   * own default behavior (today's exact bytes).
+   */
+  readonly dialectPolicy?: DialectPolicy;
+  /**
+   * Resolved thinking config (see `translation/dialect/thinking-ladder`).
+   * Absent = the codec's own default behavior (today's exact clamp/ladder).
+   */
+  readonly thinking?: ThinkingConfig;
 }
 
 /**
@@ -27,7 +39,13 @@ type CodecModule =
       readonly family: "messages";
       readonly encodeWireRequest: (
         request: CanonicalRequest,
-        options?: { isOAuth?: boolean },
+        options?: {
+          readonly isOAuth?: boolean;
+          readonly maxBytesOverride?: number;
+          readonly dialectPolicy?: DialectPolicy;
+          readonly thinking?: ThinkingConfig;
+          readonly maxOutputTokens?: number;
+        },
       ) => Record<string, unknown>;
       readonly decodeWireResponse: (
         json: Record<string, unknown>,
@@ -48,6 +66,8 @@ type CodecModule =
           readonly supportsPromptCaching?: boolean;
           readonly tokenLimitField?: "max_tokens" | "max_completion_tokens";
           readonly promptCacheKey?: string;
+          readonly dialectPolicy?: DialectPolicy;
+          readonly thinking?: ThinkingConfig;
         },
       ) => Record<string, unknown>;
       readonly decodeWireResponse: (
@@ -58,6 +78,7 @@ type CodecModule =
         body: ReadableStream<Uint8Array>,
         request: CanonicalRequest,
         signal?: AbortSignal,
+        options?: { readonly dialectPolicy?: DialectPolicy },
       ) => AsyncIterable<CanonicalEvent>;
     }
   | {
@@ -67,6 +88,9 @@ type CodecModule =
         options?: {
           readonly supportsPromptCaching?: boolean;
           readonly promptCacheKey?: string;
+          readonly dialectPolicy?: DialectPolicy;
+          readonly thinking?: ThinkingConfig;
+          readonly maxOutputTokens?: number;
         },
       ) => Record<string, unknown>;
       readonly decodeWireResponse: (
@@ -89,8 +113,10 @@ type CodecModule =
  *
  * The dynamic import is awaited by the caller. Wire encoding happens before the
  * upstream request is issued, so the cost is paid once, on the first request,
- * and is subsequently free. `preloadCodecs()` warms it during boot to remove
- * even that first-request delay.
+ * The cost is paid once, on the first request for that family, because wire
+ * encoding happens before the upstream request is issued. There is no preload
+ * at boot: no family is knowable then, and eagerly loading all three codecs
+ * would defeat the ~50 MiB of resident memory this indirection removes.
  */
 const codecCache = new Map<WireFamily, Promise<CodecModule>>();
 
@@ -103,8 +129,8 @@ const codecCache = new Map<WireFamily, Promise<CodecModule>>();
  * a gateway instance only ever serves one family.
  *
  * The cost is paid once, on the first request for that family, because wire
- * encoding happens before the upstream request is issued. `preloadCodec()`
- * warms it during boot so even that first-request delay disappears.
+ * encoding happens before the upstream request is issued. No boot-time preload
+ * exists — see the note on `codecCache` above.
  */
 async function loadCodec(wireFamily: WireFamily): Promise<CodecModule> {
   const cached = codecCache.get(wireFamily);
@@ -127,15 +153,6 @@ async function loadCodec(wireFamily: WireFamily): Promise<CodecModule> {
   return promise;
 }
 
-/**
- * Warms the codec module for a wire family during boot so the first request
- * does not pay the dynamic-import cost. Safe to call concurrently; the cache
- * deduplicates.
- */
-export function preloadCodec(wireFamily: WireFamily): Promise<void> {
-  return loadCodec(wireFamily).then(() => undefined);
-}
-
 export async function encodeWireRequest(
   wireFamily: WireFamily,
   request: CanonicalRequest,
@@ -148,6 +165,11 @@ export async function encodeWireRequest(
       ...(context?.maxBytesOverride === undefined
         ? {}
         : { maxBytesOverride: context.maxBytesOverride }),
+      ...(context?.maxOutputTokens === undefined
+        ? {}
+        : { maxOutputTokens: context.maxOutputTokens }),
+      ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+      ...(context?.thinking === undefined ? {} : { thinking: context.thinking }),
     });
   }
   if (codec.family === "chat") {
@@ -164,6 +186,8 @@ export async function encodeWireRequest(
       ...(context?.promptCacheKey === undefined
         ? {}
         : { promptCacheKey: context.promptCacheKey }),
+      ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+      ...(context?.thinking === undefined ? {} : { thinking: context.thinking }),
     });
   }
   return codec.encodeWireRequest(request, {
@@ -173,6 +197,11 @@ export async function encodeWireRequest(
     ...(context?.promptCacheKey === undefined
       ? {}
       : { promptCacheKey: context.promptCacheKey }),
+    ...(context?.maxOutputTokens === undefined
+      ? {}
+      : { maxOutputTokens: context.maxOutputTokens }),
+    ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+    ...(context?.thinking === undefined ? {} : { thinking: context.thinking }),
   });
 }
 
@@ -204,6 +233,12 @@ export function decodeWireStream(
       // The Anthropic decoder does not take the canonical request: it rebuilds
       // its state from the SSE frames alone.
       yield* codec.decodeWireStream(body, context?.signal, context?.isOAuth ?? false);
+      return;
+    }
+    if (codec.family === "chat") {
+      yield* codec.decodeWireStream(body, request, context?.signal, {
+        ...(context?.dialectPolicy === undefined ? {} : { dialectPolicy: context.dialectPolicy }),
+      });
       return;
     }
     yield* codec.decodeWireStream(body, request, context?.signal);

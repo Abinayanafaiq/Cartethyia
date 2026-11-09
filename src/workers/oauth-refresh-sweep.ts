@@ -9,7 +9,7 @@ export interface DueOAuthAccount {
   readonly providerId: string;
 }
 
-export interface OAuthRefreshSweepDeps {
+interface OAuthRefreshSweepDeps {
   readonly loadDueAccounts: () => Promise<readonly DueOAuthAccount[]>;
   readonly refreshService: Pick<OAuthRefreshService, "ensureFreshAccessToken">;
   /** Resolves a provider's token-endpoint client; accounts with no registered refresher are skipped. */
@@ -17,6 +17,12 @@ export interface OAuthRefreshSweepDeps {
   readonly skewMs?: number;
   /** Maximum accounts in one completed wave. Defaults to 5. */
   readonly maxConcurrency?: number;
+  /**
+   * Wall-clock cap for the whole pass; the next wave does not start past it
+   * (G-04). Mirrors the quota refresh sweep's 45 s pass budget so OAuth
+   * refreshes cannot run away into a heavy foreground minute.
+   */
+  readonly budgetMs?: number;
   /**
    * Milliseconds to pause between accounts when running sequentially. Absent
    * keeps the default wave behavior. Providers whose token endpoint rate-limits
@@ -70,6 +76,7 @@ export async function oauthRefreshSweep(deps: OAuthRefreshSweepDeps): Promise<vo
     ...(deps.interItemDelayMs === undefined
       ? {}
       : { pace: { interItemDelayMs: deps.interItemDelayMs } }),
+    ...(deps.budgetMs === undefined ? {} : { budgetMs: deps.budgetMs }),
   });
 
   // A pass that could not even list its accounts reports no tick: an all-zero

@@ -41,7 +41,7 @@ import type { PreparedProxyRequest } from "../request/preparer";
 
 import type { GatewayHandlerDeps } from "./handler-deps";
 
-export type ProviderProxyHandlerDeps = GatewayHandlerDeps & {
+type ProviderProxyHandlerDeps = GatewayHandlerDeps & {
   /** Live lookup of a provider's SSRF-validated upstream host. */
   readonly byokUpstreamHosts?: { readonly get: (providerId: string) => ByokUpstreamHost | undefined };
 };
@@ -240,6 +240,7 @@ export async function handleProviderProxyRequest(
         ...(candidate.output_limit == null ? {} : { output_limit: candidate.output_limit }),
         capabilities: candidate.capability_profile,
         user_agent: candidate.user_agent,
+        ...(candidate.dialect === undefined ? {} : { dialect: candidate.dialect }),
       };
       const candidateRequest =
         candidate.model_id === dispatchRequest.model

@@ -62,6 +62,7 @@ import type { ValidatedNetworkBindingFactory } from "../network/pool/resolver";
 import { metrics } from "../observability/metrics";
 import type { RuntimeMetricsSampler } from "../observability/runtime-metrics";
 import { API_CONTENT_SECURITY_POLICY, X_FRAME_OPTIONS } from "../security/outbound-headers";
+import { setProxyBusySource } from "../shared/invoke-guard";
 
 
 import type { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
@@ -107,7 +108,7 @@ interface GatewayShellDeps {
  * `runtime/dependencies.ts` either supplies it or the app does not boot, so
  * there is no runtime shape check to fall through.
  */
-export interface ProductionAppDeps {
+interface ProductionAppDeps {
   readonly mode: "production";
   readonly db: CartethyiaDatabase;
   readonly proxyPreparer: ProxyRequestPreparer;
@@ -160,6 +161,23 @@ export interface ProductionAppDeps {
 /** Either app mode. The discriminant decides which builder path runs. */
 type GatewayAppDeps = GatewayShellDeps | ProductionAppDeps;
 
+/**
+ * Adapts the static handler's `Uint8Array | undefined` body to `BodyInit`.
+ *
+ * Typed-array buffers are `ArrayBufferLike` (may be a SharedArrayBuffer), but
+ * `BodyInit` only accepts `ArrayBuffer`-backed views, so a direct assignment
+ * does not type-check. The common case reuses the same bytes without copying;
+ * the exotic SharedArrayBuffer case falls back to a copy. This replaces the
+ * old `as unknown as BodyInit` double cast with a structural guard.
+ */
+function staticBodyToInit(body: Uint8Array | undefined): BodyInit | null {
+  if (body === undefined) return null;
+  if (body.buffer instanceof ArrayBuffer) {
+    return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  }
+  return new Uint8Array(body);
+}
+
 function checkDatabaseConnection(): Promise<void> {
   return getDbHandle()
     .query("SELECT 1")
@@ -206,7 +224,7 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     // The client's `accept-encoding` is what decides whether a precompressed
     // `.gz` sibling can be served instead of the plain asset.
     const result = await staticHandler(pathname, request.headers.get("accept-encoding"));
-    return new Response(result.body ? (result.body as unknown as BodyInit) : null, {
+    return new Response(staticBodyToInit(result.body), {
       status: result.status,
       headers: result.headers,
     });
@@ -243,6 +261,12 @@ export function createGatewayApp(deps: GatewayAppDeps) {
     deps.mode === "production" ? deps.shutdownCoordinator : undefined,
   );
   deps.runtimeMetricsSampler?.bindInFlight(() => requestStateStore.inFlightCount());
+  // G-03 InvokeGuard: expose the proxy plane's live in-flight count as the
+  // "foreground busy" source the scheduled worker registry consults before a
+  // tick. Bound once here, where the request store exists; a proxy invoke in
+  // progress (or a page-open console poll) keeps background sweeps from
+  // contending for the single event loop.
+  setProxyBusySource(() => requestStateStore.inFlightCount() > 0);
   // Vision handoff runs as an internal sub-dispatch when the tenant configured
   // an ordered list of vision models. Wire the preparer's runner here, where
   // the request state store and the full dispatch dependency surface exist.
@@ -663,6 +687,10 @@ export function createGatewayApp(deps: GatewayAppDeps) {
           stateStore: requestStateStore,
           resolvePeerAddress: (request) => peerAddresses.get(request) ?? null,
           trustedProxyBoundary: deps.trustedProxyBoundary,
+          // The update apply route drains through the process coordinator
+          // before exiting, so the destructive path cannot skip telemetry
+          // flush and pool close.
+          shutdownCoordinator: deps.shutdownCoordinator,
         }),
       );
     }

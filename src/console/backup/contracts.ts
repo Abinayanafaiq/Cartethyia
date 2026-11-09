@@ -170,9 +170,15 @@ const SEALED_COLUMNS: Readonly<Record<string, Readonly<Record<string, string>>>>
   share_links: { token_encrypted: "share_token" },
 };
 
+const SEALED_COLUMNS_CACHE = new WeakMap<Table, ReadonlySet<string>>();
+
 /** The sealed columns of `table`, by column name. */
 export function sealedColumns(table: Table): ReadonlySet<string> {
-  return new Set(Object.keys(SEALED_COLUMNS[getTableName(table)] ?? {}));
+  const cached = SEALED_COLUMNS_CACHE.get(table);
+  if (cached) return cached;
+  const names = new Set(Object.keys(SEALED_COLUMNS[getTableName(table)] ?? {}));
+  SEALED_COLUMNS_CACHE.set(table, names);
+  return names;
 }
 
 /**
@@ -205,7 +211,6 @@ export function sealedAliases(table: Table): ReadonlyMap<string, string> {
   return out;
 }
 
-
 /**
  * Which rows of a table belong to one tenant, and how a restore replaces them.
  *
@@ -236,7 +241,7 @@ export function sealedAliases(table: Table): ReadonlyMap<string, string> {
  * - `self` — the tenant row itself, matched on its own id, upserted and never
  *   deleted.
  */
-export type TableOwnership =
+type TableOwnership =
   | { readonly kind: "direct"; readonly column: Column; readonly replace: "delete" | "upsert" }
   | {
       readonly kind: "viaParent";
@@ -493,7 +498,7 @@ export function findTable(section: BackupSection, name: string): Table | undefin
   return tablesForSection(section).find((table) => tableName(table) === name);
 }
 
-export interface BackupExportResult {
+export interface BackupPayloadExport {
   readonly payload: BackupPayload;
   readonly counts: Record<string, number>;
 }
@@ -509,11 +514,6 @@ export interface ValidatedTable {
   readonly table: Table;
   readonly mode: "replace" | "append";
   readonly rows: readonly BackupRow[];
-}
-
-export interface RestoreResult {
-  readonly restored: Record<string, number>;
-  readonly skipped: Record<string, number>;
 }
 
 /**

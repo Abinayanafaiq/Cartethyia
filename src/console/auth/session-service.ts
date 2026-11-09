@@ -58,7 +58,7 @@ function newSessionToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-export class ConsoleSessionStore {
+class ConsoleSessionStore {
   constructor(private readonly db: CartethyiaDatabase) {}
 
   async create(newSession: {
@@ -73,7 +73,13 @@ export class ConsoleSessionStore {
     const inserted = await returningRows(this.db.insert(consoleSessions).values(newSession));
     assertMutationApplied(inserted, "Console session");
     const persisted = sessionRecord(inserted.rows[0]);
-    return persisted ?? ({ ...newSession } as unknown as ConsoleSession);
+    if (!persisted) {
+      // `assertMutationApplied` already refused a failed insert, so an
+      // unshaped row here is a driver/schema mismatch — pretending success by
+      // returning the input cast to ConsoleSession would mask it.
+      throw new Error("Console session row could not be coerced after insert");
+    }
+    return persisted;
   }
 
   async findValidByTokenHash(tokenHash: string, now: Date): Promise<ConsoleSession | null> {
