@@ -57,6 +57,7 @@ import {
 } from "./sections/ImportCredentialDialog";
 import { AddModelModal, ModelGrid, ShowSelect, ThinkingSelect, type ModelShowFilter } from "./sections/Models";
 import { PROBE_REASONING_EFFORTS, type ProbeReasoningEffort } from "../../data/contracts";
+import { refreshAfterAccountsDeleted } from "../../hooks/quota";
 
 type DashboardServiceKind = "llm" | "websearch" | "imageGeneration" | "videoGeneration";
 
@@ -894,18 +895,10 @@ export default function ProviderDetail(): ReactNode {
             await consoleRequest(path, {
               method: "DELETE",
             });
-            queryClient.removeQueries({
-              queryKey: queryKeys.quota.account(deleteTarget.id),
-              exact: true,
-            });
-            await Promise.all([
-              queryClient.invalidateQueries({ queryKey: queryKeys.providers.accounts(id) }),
-              queryClient.invalidateQueries({
-                queryKey: queryKeys.providers.healthEvents(id, deleteTarget.id),
-              }),
-              queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
-              queryClient.invalidateQueries({ queryKey: queryKeys.quota.all }),
-            ]);
+            // Background refresh of only what a delete changes; awaiting a
+            // refetch of every provider query (usage matrix included) kept
+            // this dialog spinning and stalled a lite gateway.
+            void refreshAfterAccountsDeleted(queryClient, id, [deleteTarget.id]);
             toast.success(
               "Account deleted",
               deleteTarget.label || deleteTarget.id.slice(0, 8),

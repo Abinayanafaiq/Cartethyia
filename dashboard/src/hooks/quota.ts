@@ -2,7 +2,7 @@ import { consoleRequest } from "../data/api";
 import type { ApiErrorShape } from "../data/api";
 import { queryKeys } from "../data/query-keys";
 import { querySignal } from "../data/assert";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 
 export interface QuotaProviderSummary {
@@ -242,6 +242,81 @@ export function useSetAccountsActiveBatch() {
   });
 }
 
+/** Result of a batch account delete: ids removed and ids that were already gone. */
+export interface AccountBatchDeleteResult {
+  readonly deleted: readonly string[];
+  readonly missing: readonly string[];
+}
+
+/**
+ * Deletes accounts in at most two requests — one for tenant-owned rows, one
+ * for shared (global, `tenantId === null`) rows — instead of one request per
+ * account. Each batch is a single server-side DELETE with one snapshot
+ * invalidation and one audit row.
+ */
+export async function batchDeleteAccounts(
+  accounts: readonly { readonly id: string; readonly tenantId: string | null }[],
+): Promise<AccountBatchDeleteResult> {
+  const owned = accounts.filter((account) => account.tenantId !== null).map((account) => account.id);
+  const shared = accounts.filter((account) => account.tenantId === null).map((account) => account.id);
+  const batches = await Promise.all([
+    owned.length === 0
+      ? undefined
+      : consoleRequest<AccountBatchDeleteResult>("/accounts/batch-delete", {
+          method: "POST",
+          body: JSON.stringify({ accountIds: owned }),
+        }),
+    shared.length === 0
+      ? undefined
+      : consoleRequest<AccountBatchDeleteResult>("/global/accounts/batch-delete", {
+          method: "POST",
+          body: JSON.stringify({ accountIds: shared }),
+        }),
+  ]);
+  return {
+    deleted: batches.flatMap((batch) => batch?.deleted ?? []),
+    missing: batches.flatMap((batch) => batch?.missing ?? []),
+  };
+}
+
+/**
+ * Drops deleted accounts' cached reads and refreshes only what a delete
+ * changes: the provider's account list, the provider list (its counts), and
+ * the quota overview.
+ *
+ * It deliberately does not invalidate the whole `providers` prefix. That
+ * prefix includes every provider's models, routing, and usage matrix; the
+ * matrix aggregates every telemetry event of the provider, and on a lite
+ * install that synchronous scan stalled the whole gateway for seconds after
+ * each delete. None of those reads changes when an account is removed.
+ */
+export function refreshAfterAccountsDeleted(
+  queryClient: QueryClient,
+  providerId: string | undefined,
+  accountIds: readonly string[],
+): Promise<void> {
+  for (const accountId of accountIds) {
+    // Prefix removal: the account's quota and its resets list.
+    queryClient.removeQueries({ queryKey: queryKeys.quota.account(accountId) });
+    if (providerId !== undefined) {
+      queryClient.removeQueries({ queryKey: queryKeys.providers.healthEvents(providerId, accountId) });
+    }
+  }
+  return Promise.all([
+    providerId === undefined
+      ? queryClient.invalidateQueries({
+          predicate: (query) =>
+            query.queryKey.length === 4 &&
+            query.queryKey[0] === "console" &&
+            query.queryKey[1] === "providers" &&
+            query.queryKey[3] === "accounts",
+        })
+      : queryClient.invalidateQueries({ queryKey: queryKeys.providers.accounts(providerId), exact: true }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.providers.all, exact: true }),
+    queryClient.invalidateQueries({ queryKey: queryKeys.quota.all, exact: true }),
+  ]).then(() => undefined);
+}
+
 /** Deletes a quota-tracked account. */
 export function useDeleteQuotaAccount() {
   const queryClient = useQueryClient();
@@ -251,12 +326,10 @@ export function useDeleteQuotaAccount() {
         method: "DELETE",
       });
     },
-    onSuccess: async (_result, accountId) => {
-      queryClient.removeQueries({ queryKey: queryKeys.quota.account(accountId), exact: true });
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: queryKeys.quota.all }),
-        queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
-      ]);
+    onSuccess: (_result, accountId) => {
+      // Not awaited: the delete is done; the refresh happens in the background
+      // instead of keeping the button busy until every list has re-read.
+      void refreshAfterAccountsDeleted(queryClient, undefined, [accountId]);
     },
   });
 }

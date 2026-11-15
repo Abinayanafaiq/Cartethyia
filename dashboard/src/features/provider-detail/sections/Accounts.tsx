@@ -24,7 +24,13 @@ import {
   useUpdateProviderAccount,
 } from "../../../hooks/providers";
 import { useProviderAccountInflight } from "../../../hooks/routing";
-import { useQuotaOverview, type AccountTestResult, type QuotaWindow } from "../../../hooks/quota";
+import {
+  batchDeleteAccounts,
+  refreshAfterAccountsDeleted,
+  useQuotaOverview,
+  type AccountTestResult,
+  type QuotaWindow,
+} from "../../../hooks/quota";
 import { queryKeys } from "../../../data/query-keys";
 import { downloadTextFile } from "../../../lib/download";
 import { toast } from "../../../lib/toast";
@@ -279,23 +285,30 @@ const TEST_ALL_CONCURRENCY = 3;
   };
 
   const bulkDelete = async () => {
-    await runBulk("Delete", async (account) => {
-      // Shared accounts carry `tenant_id IS NULL` and live under the
-      // global-admin route; the tenant-scoped path can never match them.
-      const path =
-        account.tenantId === null
-          ? `/global/accounts/${encodeURIComponent(account.id)}`
-          : `/accounts/${encodeURIComponent(account.id)}`;
-      await consoleRequest(path, { method: "DELETE" });
-      queryClient.removeQueries({ queryKey: queryKeys.quota.account(account.id), exact: true });
-    });
-    setSelected(new Set());
-    setBulkDeleteOpen(false);
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: queryKeys.providers.accounts(providerId) }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.providers.all }),
-      queryClient.invalidateQueries({ queryKey: queryKeys.quota.all }),
-    ]);
+    if (selectedAccounts.length === 0) return;
+    setBulkBusy(true);
+    try {
+      // One batch request (two when shared accounts are selected too), not one
+      // DELETE per account. Shared accounts carry `tenant_id IS NULL` and go
+      // through the global-admin batch route.
+      const result = await batchDeleteAccounts(selectedAccounts);
+      setSelected(new Set());
+      setBulkDeleteOpen(false);
+      if (result.missing.length === 0) {
+        toast.success("Delete complete", `${result.deleted.length} account${result.deleted.length === 1 ? "" : "s"}`);
+      } else {
+        toast.error(
+          "Delete partially failed",
+          `${result.deleted.length} deleted, ${result.missing.length} not found or not permitted`,
+        );
+      }
+      // Background refresh: the dialog closes as soon as the rows are gone.
+      void refreshAfterAccountsDeleted(queryClient, providerId, result.deleted);
+    } catch (err) {
+      toast.error("Delete failed", (err as { message?: string }).message ?? "Unable to delete accounts");
+    } finally {
+      setBulkBusy(false);
+    }
   };
 
   return (

@@ -48,6 +48,7 @@ import { resolveTelemetryRetentionDays } from "../config/telemetry";
 import { payloadRetentionMs, resolvePayloadCapture } from "../observability/payload-capture";
 import { TELEMETRY_EVENT_DIR } from "../observability/event-log";
 import { providerUsageMatrix } from "../observability/event-query";
+import { createCachedProviderUsageMatrix } from "./providers/catalog/usage-matrix-cache";
 
 import { InMemoryOAuthFlowStore, OAuthFlowStore } from "../providers/authentication/oauth-flow-store";
 import { OAuthCallbackListener } from "./providers/oauth/callback-listener";
@@ -279,6 +280,10 @@ export function registerConsoleDomains(
     resolveConfigKey: () => inferhubKeys.read(),
     keyStore: inferhubKeys,
   }));
+  const cachedProviderUsageMatrix = createCachedProviderUsageMatrix(
+    (tenantId, providerId, since, until) =>
+      providerUsageMatrix(ctx.db, tenantId, providerId, since, until),
+  );
   console.use(createProviderCatalogRoutes({
     store: providerCatalogStore,
     accessResolver: ctx.accessResolver,
@@ -295,13 +300,9 @@ export function registerConsoleDomains(
       aliases: await modelRoutingStore.listAliases(tenantId),
       combos: await modelRoutingStore.listCombos(tenantId),
     }),
-    providerUsageMatrix: (tenantId, providerId, days) =>
-      providerUsageMatrix(
-        ctx.db,
-        tenantId,
-        providerId,
-        new Date(Date.now() - days * 86_400_000),
-      ),
+    // Finished days are cached per UTC day; only today's events are re-read
+    // per call (see usage-matrix-cache.ts for the measured stall it removes).
+    providerUsageMatrix: cachedProviderUsageMatrix,
   }));
   console.use(createProviderDetailRoutes({
     store: providerDetailStore,

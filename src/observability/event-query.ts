@@ -17,7 +17,7 @@
  *   latency arrays are never returned to JavaScript;
  * - `isGatewayError()` semantics live in one shared SQL predicate.
  */
-import { and, desc, eq, gte, inArray, isNotNull, or, sql, type SQL } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, or, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { CartethyiaDatabase } from "../persistence/db-handle";
 import { apiKeys, telemetryEvents, telemetryUsageTotals } from "../persistence/schema";
@@ -610,8 +610,12 @@ export async function providerUsageMatrix(
   tenantId: string,
   providerId: string,
   since: Date,
+  until?: Date,
 ): Promise<ProviderUsageDayRow[]> {
   const dayExpression = bucketExpression(db, telemetryEvents.createdAt, 86400);
+  const window = until === undefined
+    ? scoped(tenantId, since)
+    : and(scoped(tenantId, since), lt(telemetryEvents.createdAt, until));
   const rows = await db
     .select({
       day: dayExpression,
@@ -623,7 +627,7 @@ export async function providerUsageMatrix(
       costUsd: sql<number>`coalesce(sum(${telemetryEvents.estimatedCostUsd}), 0)`,
     })
     .from(telemetryEvents)
-    .where(and(scoped(tenantId, since), eq(telemetryEvents.providerId, providerId)))
+    .where(and(window, eq(telemetryEvents.providerId, providerId)))
     .groupBy(dayExpression, telemetryEvents.requestedModel)
     .orderBy(dayExpression);
   return rows.map((row) => ({
