@@ -182,6 +182,7 @@ export const CONFIG_SPEC = {
    * filters, and the detail drawer stay complete.
    */
   CARTETHYIA_TELEMETRY_RETENTION_DAYS: { kind: "int", default: 30, min: 3, max: 365 },
+  CARTETHYIA_HEALTH_EVENT_RETENTION_DAYS: { kind: "int", default: 7, min: 1, max: 365 },
   CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES: {
     kind: "int",
     default: 16 * 1024 * 1024,

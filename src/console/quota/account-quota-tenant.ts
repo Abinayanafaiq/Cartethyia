@@ -76,6 +76,8 @@ import {
   type DailyGrowthJobAccount,
   type DailyGrowthJobDeps,
 } from "./daily-growth-job";
+import { healthEventBuffer } from "../../persistence/health-event-flush";
+import { purgeHealthEventsForAccounts } from "../../persistence/health-event-retention";
 
 /** Daily check-in only exists on the buddy billing facade; everything else 400s with intent. */
 function supportsAccountCheckin(providerId: string): boolean {
@@ -814,11 +816,22 @@ export function registerAccountQuotaTenantRoutes(
     .delete("/accounts/:id", async ({ request, params, set }) => {
       const access = requireTenantScope(accessResolver(request), "dashboard:write");
       const accountId = params.id;
+      const owned = and(eq(providerAccounts.id, accountId), eq(providerAccounts.tenantId, access.tenantId));
+      // Ownership first: the incremental health-event purge below must never
+      // touch another tenant's rows.
+      const found = await db.select({ id: providerAccounts.id }).from(providerAccounts).where(owned).limit(1);
+      if (found.length === 0) {
+        set.status = 404;
+        return { error: `Account ${accountId} not found`, code: "not_found" };
+      }
+      // A busy account can carry tens of thousands of health events; drain the
+      // queued ones and delete the rest in yielding batches so the FK cascade
+      // does not hold the event loop in one long statement.
+      await healthEventBuffer()?.drain(accountId);
+      await purgeHealthEventsForAccounts(db, [accountId]);
       const deleted = await db
         .delete(providerAccounts)
-        .where(
-          and(eq(providerAccounts.id, accountId), eq(providerAccounts.tenantId, access.tenantId)),
-        )
+        .where(owned)
         .returning({ id: providerAccounts.id });
       if (deleted.length === 0) {
         set.status = 404;
@@ -852,14 +865,21 @@ export function registerAccountQuotaTenantRoutes(
         // One DELETE statement for the whole batch, scoped to the tenant: a
         // global/shared account (`tenant_id IS NULL`) is never matchable, so
         // it lands in `missing` rather than being deleted by a tenant.
+        const owned = and(
+          inArray(providerAccounts.id, accountIds),
+          eq(providerAccounts.tenantId, access.tenantId),
+        );
+        // Health events of the owned rows go first, in yielding batches (see
+        // the single-account route).
+        const ownedIds = (
+          await db.select({ id: providerAccounts.id }).from(providerAccounts).where(owned)
+        ).map((row) => row.id);
+        const buffer = healthEventBuffer();
+        if (buffer !== undefined) for (const id of ownedIds) await buffer.drain(id);
+        await purgeHealthEventsForAccounts(db, ownedIds);
         const deleted = await db
           .delete(providerAccounts)
-          .where(
-            and(
-              inArray(providerAccounts.id, accountIds),
-              eq(providerAccounts.tenantId, access.tenantId),
-            ),
-          )
+          .where(owned)
           .returning({ id: providerAccounts.id });
         const deletedIds = deleted.map((row) => row.id);
         const deletedSet = new Set(deletedIds);

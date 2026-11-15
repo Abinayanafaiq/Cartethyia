@@ -26,6 +26,8 @@ import {
   type AccountQuotaRoutesDeps,
   type AccountStatus,
 } from "./account-quota-shared";
+import { healthEventBuffer } from "../../persistence/health-event-flush";
+import { purgeHealthEventsForAccounts } from "../../persistence/health-event-retention";
 
 /**
  * Registers the platform-admin account/quota routes onto `app`. Every route here
@@ -106,9 +108,19 @@ export function registerAccountQuotaGlobalRoutes(
       // true) — the console's delete button 404'd on every shared account.
       // This route is the global-admin counterpart, scoped by `isNull` instead
       // of a tenant id.
+      const shared = and(eq(providerAccounts.id, accountId), isNull(providerAccounts.tenantId));
+      const found = await db.select({ id: providerAccounts.id }).from(providerAccounts).where(shared).limit(1);
+      if (found.length === 0) {
+        set.status = 404;
+        return { error: `Global account ${accountId} not found`, code: "not_found" };
+      }
+      // Incremental health-event purge before the row goes (see the tenant
+      // route): the cascade would otherwise delete them in one long statement.
+      await healthEventBuffer()?.drain(accountId);
+      await purgeHealthEventsForAccounts(db, [accountId]);
       const deleted = await db
         .delete(providerAccounts)
-        .where(and(eq(providerAccounts.id, accountId), isNull(providerAccounts.tenantId)))
+        .where(shared)
         .returning({ id: providerAccounts.id });
       if (deleted.length === 0) {
         set.status = 404;
@@ -139,9 +151,16 @@ export function registerAccountQuotaGlobalRoutes(
       // One DELETE statement scoped to shared accounts only: a tenant-owned row
       // (`tenant_id IS NOT NULL`) is never matchable by a global admin, so it
       // lands in `missing`.
+      const shared = and(inArray(providerAccounts.id, accountIds), isNull(providerAccounts.tenantId));
+      const sharedIds = (
+        await db.select({ id: providerAccounts.id }).from(providerAccounts).where(shared)
+      ).map((row) => row.id);
+      const buffer = healthEventBuffer();
+      if (buffer !== undefined) for (const id of sharedIds) await buffer.drain(id);
+      await purgeHealthEventsForAccounts(db, sharedIds);
       const deleted = await db
         .delete(providerAccounts)
-        .where(and(inArray(providerAccounts.id, accountIds), isNull(providerAccounts.tenantId)))
+        .where(shared)
         .returning({ id: providerAccounts.id });
       const deletedIds = deleted.map((row) => row.id);
       const deletedSet = new Set(deletedIds);

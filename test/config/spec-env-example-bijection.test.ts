@@ -57,6 +57,8 @@ const SPEC_ONLY_KEYS: Readonly<Record<string, true>> = {
   // the deployment-level knob stays in CONFIG_SPEC but is doc-only.
   CARTETHYIA_TELEMETRY_RETENTION_DAYS: true,
   CARTETHYIA_TELEMETRY_PAYLOAD_MAX_BYTES: true,
+  // Health-event retention: a deployment-level knob with a safe default.
+  CARTETHYIA_HEALTH_EVENT_RETENTION_DAYS: true,
 };
 
 /** Keys in `.env.example` that `CONFIG_SPEC` does not declare. */

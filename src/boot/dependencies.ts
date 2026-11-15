@@ -73,7 +73,8 @@ import {
 } from "../config/security";
 import { resolveSsrfPolicy, resolveTrustedProxyBoundary } from "../config/network";
 import type { TrustedProxyBoundary } from "../config/network";
-import { resolveTelemetryRetentionDays } from "../config/telemetry";
+import { resolveHealthEventRetentionDays, resolveTelemetryRetentionDays } from "../config/telemetry";
+import { pruneHealthEvents } from "../persistence/health-event-retention";
 import { resolveConcurrencyTolerance } from "../config/resources";
 import { CONFIG_SPEC, readInt, readList } from "../config/spec";
 import type { ProviderAdapter } from "../providers/provider-contracts";
@@ -400,6 +401,20 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
       telemetryStore.pruneTelemetry(
         new Date(Date.now() - resolveTelemetryRetentionDays() * 24 * 60 * 60_000),
       ),
+  });
+  scheduledTasks.register({
+    name: "health-event-retention",
+    intervalMs: 6 * 60 * 60_000,
+    // Deletes for the whole deployment, like telemetry retention: one runner.
+    shared: true,
+    // Yielding batches (see health-event-retention.ts): a large first backlog
+    // drains over a few runs without stalling request handling.
+    run: async () => {
+      await pruneHealthEvents(
+        db,
+        new Date(Date.now() - resolveHealthEventRetentionDays() * 24 * 60 * 60_000),
+      );
+    },
   });
   const telemetryBuffer = new TelemetryBatchBuffer(db);
   const poolSelector = new NetworkPoolSelector(redis);

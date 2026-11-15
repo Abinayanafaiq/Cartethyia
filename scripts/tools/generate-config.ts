@@ -83,7 +83,7 @@ const SECTIONS: ReadonlyArray<{ readonly title: string; readonly match: RegExp }
     match: /^TRUSTED_PROXY_CIDRS$|^CARTETHYIA_ALLOW_PRIVATE_UPSTREAMS$|^CARTETHYIA_ALLOWED_NETWORKS$|^CARTETHYIA_MAX_REDIRECTS$/,
   },
   { title: "Runtime memory", match: /^CARTETHYIA_MEMORY_LIMIT_BYTES$/ },
-  { title: "Telemetry", match: /^CARTETHYIA_TELEMETRY_/ },
+  { title: "Telemetry", match: /^CARTETHYIA_TELEMETRY_|^CARTETHYIA_HEALTH_EVENT_RETENTION_DAYS$/ },
   {
     title: "Upstream timeouts and retry backoff",
     match: /^CARTETHYIA_UPSTREAM_TIMEOUT_MS$|^CARTETHYIA_STREAM_|^CARTETHYIA_FALLBACK_RETRY_|^CARTETHYIA_ROUTE_MAX_ATTEMPTS$/,
