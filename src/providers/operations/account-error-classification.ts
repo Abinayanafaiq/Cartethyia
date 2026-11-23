@@ -1599,7 +1599,11 @@ const ACCOUNT_ERROR_RULES: readonly AccountErrorRule[] = [
   },
   {
     name: "model-unreachable",
-    match: (s) => s.providerCode === "not_found" || s.modelEntitlementFailure,
+    // `model_not_in_plan` is OpenScale's 400 for a plan key calling a model its
+    // plan does not include: an entitlement verdict on this (account, model)
+    // pair, while the key keeps serving its plan models.
+    match: (s) =>
+      s.providerCode === "not_found" || s.providerCode === "model_not_in_plan" || s.modelEntitlementFailure,
     decide: (s) => {
       const cooldownMs = MODEL_UNREACHABLE_COOLDOWN_MS;
       // Not credential evidence, so `classifyUpstreamFailure` scopes this to the

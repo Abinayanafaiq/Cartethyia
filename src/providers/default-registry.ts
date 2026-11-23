@@ -401,6 +401,12 @@ export const PROVIDER_CAPABILITIES = {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/bai")).BAI_SPEC),
     loadModels: async () => (await import("./integrations/bai")).BAI_FALLBACK_MODELS,
   },
+  openscale: {
+    loadAdapter: async () => createApiKeyAdapter((await import("./integrations/openscale")).OPENSCALE_SPEC),
+    loadModels: async () => (await import("./integrations/openscale")).OPENSCALE_MODELS,
+    loadModelDiscovery: async () => (await import("./integrations/openscale")).openScaleModelDiscovery(),
+    loadQuotaCollector: quotaCapability(() => import("./integrations/openscale"), "fetchOpenScaleQuota"),
+  },
   tokenharbor: {
     loadAdapter: async () => createApiKeyAdapter((await import("./integrations/tokenharbor")).TOKENHARBOR_SPEC),
     loadModels: async () => (await import("./integrations/tokenharbor")).TOKENHARBOR_FALLBACK_MODELS,

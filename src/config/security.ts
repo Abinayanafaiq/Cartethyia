@@ -3,7 +3,8 @@
  * ceiling.
  */
 
-import { CONFIG_SPEC, readInt, readRequired } from "./spec";
+import { CONFIG_SPEC, readInt, readRequired, readText } from "./spec";
+import type { UpstreamIdentityMode } from "../protocol/gateway-error";
 
 const ENCRYPTION_KEY_LENGTH = 32;
 
@@ -34,4 +35,16 @@ export function decodeEncryptionKey(raw: string): Buffer {
     );
   }
   return buf;
+}
+
+/**
+ * Whether clients may learn which upstream served them
+ * (`CARTETHYIA_UPSTREAM_IDENTITY`). Read per call so it follows the
+ * environment like every other resolver; boot calls it once so a typo fails
+ * at startup instead of on the first error a client hits.
+ */
+export function resolveUpstreamIdentityMode(): UpstreamIdentityMode {
+  const raw = readText("CARTETHYIA_UPSTREAM_IDENTITY", CONFIG_SPEC.CARTETHYIA_UPSTREAM_IDENTITY).toLowerCase();
+  if (raw === "expose" || raw === "hide") return raw;
+  throw new Error(`CARTETHYIA_UPSTREAM_IDENTITY must be "expose" or "hide" (got "${raw}")`);
 }

@@ -89,6 +89,7 @@ Variables read outside the spec are therefore **not** listed below:
 
 | Variable | Kind | Default | Bounds |
 | --- | --- | --- | --- |
+| `CARTETHYIA_UPSTREAM_IDENTITY` | string | `expose` | — |
 | `IP_RATE_MAX_PER_WINDOW` | integer | 240 | 1 – 9007199254740991 |
 | `CARTETHYIA_ENCRYPTION_KEY` | string, required | — (unset throws at startup) | — |
 | `CARTETHYIA_PUBLIC_ORIGIN` | string, required | — (unset throws at startup) | — |

@@ -1,6 +1,7 @@
 // Attempt completion bookkeeping: one home for everything every dispatch attempt ends with.
 import { readReportedModel } from "../../providers/operations/reported-model";
 import { GatewayError, publicGatewayErrorBody } from "../../protocol/gateway-error";
+import { resolveUpstreamIdentityMode } from "../../config/security";
 import type { ValidatedOutboundFetch } from "../../providers/provider-contracts";
 import { reportAttemptOutcome } from "../../providers/operations/account-health-service";
 import type { UsageRecord } from "../../protocol/canonical-model";
@@ -34,7 +35,7 @@ export function errorClientResponseBody(error: unknown): string {
   if (error instanceof GatewayError) {
     // Same serializer the error middleware sends on the wire, so the stored
     // copy cannot drift from what the client received.
-    return JSON.stringify(publicGatewayErrorBody(error));
+    return JSON.stringify(publicGatewayErrorBody(error, resolveUpstreamIdentityMode()));
   }
   return JSON.stringify({
     error: { origin: "cartethyia", code: "internal_error", message: "Internal server error" },

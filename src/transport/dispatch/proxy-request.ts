@@ -1,4 +1,6 @@
 import { isBundledProviderId } from "../../providers/provider-contracts";
+import { resolveUpstreamIdentityMode } from "../../config/security";
+import { concealResponseIdentity } from "../surface/public-identity";
 import type { ProviderDispatchContext, ProviderId, ProviderAdapter } from "../../providers/provider-contracts";
 import { GatewayError } from "../../protocol/gateway-error";
 import { isWrappedInjectionProvider } from "../../console/system-prompt/contracts";
@@ -372,14 +374,25 @@ export async function handleProviderProxyRequest(
         created: Date.now() / 1000,
         include_usage: dispatchRequest.generation_controls["extension:include_usage"] === true,
       };
+      // Under `CARTETHYIA_UPSTREAM_IDENTITY=hide` the encoders see the model
+      // name the client asked for instead of the upstream's own; `events`
+      // itself stays untouched for telemetry (`reportedModelFrom` below).
+      const concealedModel =
+        resolveUpstreamIdentityMode() === "hide"
+          ? (prepared.plan?.requested_model ?? dispatchRequest.model)
+          : undefined;
+      const clientEvents =
+        concealedModel === undefined
+          ? events
+          : events.map((event) => concealResponseIdentity(event, concealedModel, dispatchRequest.source_surface));
       const output =
         dispatchRequest.source_surface === "chat"
-          ? chatAdapter.encode(events, options)
+          ? chatAdapter.encode(clientEvents, options)
           : dispatchRequest.source_surface === "responses"
-            ? responsesAdapter.encodeOutput(events, { ...options, model: dispatchRequest.model })
+            ? responsesAdapter.encodeOutput(clientEvents, { ...options, model: concealedModel ?? dispatchRequest.model })
             : dispatchRequest.source_surface === "messages"
-              ? messagesAdapter.encodeOutput(events, options as never)
-              : completionAdapter.encodeOutput(events, {
+              ? messagesAdapter.encodeOutput(clientEvents, options as never)
+              : completionAdapter.encodeOutput(clientEvents, {
                   ...options,
                   prompt: dispatchRequest.generation_controls["extension:completion.prompt"],
                   echo: dispatchRequest.generation_controls["extension:completion.echo"] === true,

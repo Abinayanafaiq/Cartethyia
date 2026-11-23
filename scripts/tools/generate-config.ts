@@ -92,7 +92,7 @@ const SECTIONS: ReadonlyArray<{ readonly title: string; readonly match: RegExp }
   { title: "Proxy pool agents", match: /^CARTETHYIA_PROXY_/ },
   {
     title: "Security, abuse ceiling, and secrets",
-    match: /^IP_RATE_MAX_PER_WINDOW$|^CARTETHYIA_MODEL_|^CARTETHYIA_ENCRYPTION_KEY$|^CARTETHYIA_PUBLIC_ORIGIN$/,
+    match: /^IP_RATE_MAX_PER_WINDOW$|^CARTETHYIA_MODEL_|^CARTETHYIA_ENCRYPTION_KEY$|^CARTETHYIA_PUBLIC_ORIGIN$|^CARTETHYIA_UPSTREAM_IDENTITY$/,
   },
   { title: "Provider OAuth hosts", match: /^CARTETHYIA_KIMI_|^CARTETHYIA_GITHUB_/ },
 ];

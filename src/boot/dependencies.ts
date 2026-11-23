@@ -70,6 +70,7 @@ import { TelemetryBatchBuffer } from "../observability/telemetry-buffer";
 import { RuntimeMetricsSampler } from "../observability/runtime-metrics";
 import {
   resolveIpRateLimit,
+  resolveUpstreamIdentityMode,
 } from "../config/security";
 import { resolveSsrfPolicy, resolveTrustedProxyBoundary } from "../config/network";
 import type { TrustedProxyBoundary } from "../config/network";
@@ -210,6 +211,10 @@ export async function buildProductionDeps(): Promise<ProductionDeps> {
   // until a per-key limit is enforced N times over.
   const topology = resolveProcessTopology();
   await assertMultiProcessPreconditions(topology, redisIsReachable);
+  // Read per error at runtime; resolved once here so a misspelt value stops
+  // the boot instead of turning the first client error into a 500.
+  const upstreamIdentity = resolveUpstreamIdentityMode();
+  if (upstreamIdentity === "hide") log.info("[startup] upstream identity is hidden from clients (CARTETHYIA_UPSTREAM_IDENTITY=hide)");
   const handle = await measureStartupPhase("database-connect", bootDatabase);
   const db = handle.db;
   // One rule, no mode flag: REDIS_URL set → shared client, unset → memory.

@@ -350,6 +350,18 @@ const RAW_BUNDLED_PROVIDER_METADATA = [
   { id: "inferhub", displayName: "InferHub", baseUrl: "https://api.inferhub.dev/v1", defaultSkipProxy: true },
   { id: "aihubmix", displayName: "AiHubMix", baseUrl: "https://aihubmix.com/v1", credentialUrl: "https://aihubmix.com/token" },
   { id: "tokenharbor", displayName: "TokenHarbor", baseUrl: "https://tokenharbor.ai/v1", credentialUrl: "https://tokenharbor.ai" },
+  {
+    // A plan key's concurrency limit is not an upstream error: a request past
+    // it is held open with `: ping` keep-alives until a slot frees. The ceiling
+    // is therefore enforced here, per account, so an extra request fails over
+    // instead of queueing (see `integrations/openscale.ts`). One matches the
+    // Lite plan; raise it in Routing Strategy for a larger plan.
+    id: "openscale",
+    displayName: "OpenScale",
+    baseUrl: "https://api.openscale.so/v1",
+    credentialUrl: "https://app.openscale.so/app/keys",
+    defaultMaxInflight: 1,
+  },
   { id: "agentrouter", displayName: "AgentRouter", baseUrl: "https://agentrouter.org", hasAdapterUserAgent: true, credentialUrl: "https://agentrouter.org" },
   { id: "cline", displayName: "Cline", baseUrl: "https://api.cline.bot/api/v1", hasAdapterUserAgent: true, defaultSkipProxy: true, credentialUrl: "https://app.cline.bot" },
   { id: "cb", displayName: "CodeBuddy", baseUrl: "https://www.codebuddy.ai/v2", hasAdapterUserAgent: true, serviceKinds: ["llm", "imageGeneration", "videoGeneration"], credentialUrl: "https://www.codebuddy.ai", credentialHint: "Sign in with the same CodeBuddy account you use in the desktop app." },
@@ -537,6 +549,14 @@ export interface BundledProviderMetadata {
   readonly bespokeWire: boolean;
   /** True when the provider adapter builds its own User-Agent header. */
   readonly hasAdapterUserAgent: boolean;
+  /**
+   * Per-account inflight ceiling used while the operator has not configured
+   * one in Routing Strategy. `null` (the default for every provider that does
+   * not declare it) is unlimited — see `DEFAULT_PROVIDER_MAX_INFLIGHT`. A
+   * provider declares it only when the upstream's own concurrency limit is not
+   * signalled as an error the gateway could fail over on.
+   */
+  readonly defaultMaxInflight: number | null;
 }
 
 /** Normalizes optional identity defaults once before any provider lookup. */
@@ -550,6 +570,7 @@ export const BUNDLED_PROVIDER_METADATA: readonly BundledProviderMetadata[] = RAW
   const bespokeWire = Boolean("bespokeWire" in definition && definition.bespokeWire);
   const hasAdapterUserAgent = "hasAdapterUserAgent" in definition && definition.hasAdapterUserAgent === true;
   const serviceKinds: readonly ServiceKind[] = "serviceKinds" in definition ? definition.serviceKinds : ["llm"];
+  const defaultMaxInflight = "defaultMaxInflight" in definition ? definition.defaultMaxInflight : null;
   return {
     ...definition,
     serviceKinds,
@@ -560,6 +581,7 @@ export const BUNDLED_PROVIDER_METADATA: readonly BundledProviderMetadata[] = RAW
     jwtVerification,
     bespokeWire,
     hasAdapterUserAgent,
+    defaultMaxInflight,
   };
 });
 
@@ -587,6 +609,17 @@ export function providerCredentialUrl(providerId: string): string | undefined {
  */
 export function providerCredentialHint(providerId: string): string | undefined {
   return BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.credentialHint;
+}
+
+/**
+ * The provider's declared per-account inflight ceiling, or `null` when it
+ * declares none. Callers fall back to `DEFAULT_PROVIDER_MAX_INFLIGHT`
+ * (unlimited); custom/BYOK providers never declare one.
+ */
+export function providerDefaultMaxInflight(providerId: string): number | null {
+  return (
+    BUNDLED_PROVIDER_METADATA.find((candidate) => candidate.id === providerId)?.defaultMaxInflight ?? null
+  );
 }
 
 /** Presentation-only limitation for the provider detail page. */

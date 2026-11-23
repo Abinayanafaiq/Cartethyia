@@ -32,7 +32,11 @@ import { buildClaudeCliUserAgent } from "../../providers/operations/custom-cli-h
 import { isBundledProviderId } from "../../providers/provider-contracts";
 import type { ServiceKind, WireFamily } from "../../protocol/canonical-model";
 import { BoundedLruMap } from "./bounded-lru";
-import { providerHasAdapterUserAgent, providerUsesBespokeWire } from "../../providers/provider-metadata";
+import {
+  providerDefaultMaxInflight,
+  providerHasAdapterUserAgent,
+  providerUsesBespokeWire,
+} from "../../providers/provider-metadata";
 
 const CLAUDE_MODEL_FAMILIES = new Set(["opus", "sonnet", "haiku", "fable", "mythos"]);
 
@@ -580,7 +584,9 @@ class RouteCatalogRepository {
      * Tenant setting wins over global, mirroring skipProxy. A stored `null`
      * is the explicit unlimited choice; so is the default — a provider with no
      * routing row at all is unlimited too, because an operator who never
-     * configured a ceiling asked for none. */
+     * configured a ceiling asked for none. The one exception is a provider that
+     * declares `defaultMaxInflight` in its metadata, because its upstream limit
+     * cannot be observed as a failure to fail over on. */
     function resolveMaxInflight(
       providerId: string,
       rowTenantId: string | null,
@@ -591,7 +597,9 @@ class RouteCatalogRepository {
       const globalSetting = providerRouting.__global__?.[providerId]?.maxInflight;
       const resolved = tenantSetting ?? globalSetting;
       if (resolved === null) return undefined;
-      return resolved ?? DEFAULT_PROVIDER_MAX_INFLIGHT ?? undefined;
+      // No routing row: the provider's own declared ceiling (OpenScale, whose
+      // plan limit is a silent queue rather than an error), else unlimited.
+      return resolved ?? providerDefaultMaxInflight(providerId) ?? DEFAULT_PROVIDER_MAX_INFLIGHT ?? undefined;
     }
 
     /**

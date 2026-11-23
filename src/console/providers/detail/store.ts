@@ -3,7 +3,7 @@ import { and, eq, isNull, sql } from "drizzle-orm";
 import type { CartethyiaDatabase } from "../../../persistence/db-handle";
 import { providerRoutingSettings } from "../../../persistence/schema";
 import { resolveTenantOverride } from "../../../persistence/tenant-scope";
-import { DEFAULT_PROXY_SKIP_PROVIDER_IDS } from "../../../providers/provider-metadata";
+import { DEFAULT_PROXY_SKIP_PROVIDER_IDS, providerDefaultMaxInflight } from "../../../providers/provider-metadata";
 import { isBundledProviderId } from "../../../providers/provider-contracts";
 import type { ProviderRoutingResponse, UpdateProviderRoutingRequest } from "../catalog/contracts";
 import { DEFAULT_PROVIDER_MAX_INFLIGHT } from "../../../persistence/schema";
@@ -87,7 +87,7 @@ export class DrizzleProviderDetailStore implements ProviderDetailStore {
       tenantId,
       strategy: "fallback",
       rotateCount: 1,
-      maxInflight: DEFAULT_PROVIDER_MAX_INFLIGHT,
+      maxInflight: providerDefaultMaxInflight(providerId) ?? DEFAULT_PROVIDER_MAX_INFLIGHT,
       maxInflightPerProxy: null,
       usageFloor: null,
       usageFloorUnit: "percent",
@@ -109,7 +109,12 @@ export class DrizzleProviderDetailStore implements ProviderDetailStore {
       tenantId: tenantId ?? null,
       strategy: patch.strategy ?? "fallback",
       rotateCount: patch.rotateCount ?? 1,
-      maxInflight: patch.maxInflight ?? null,
+      // Absent on the first write keeps the provider's declared default; an
+      // explicit `null` is still the operator choosing unlimited.
+      maxInflight:
+        patch.maxInflight !== undefined
+          ? patch.maxInflight
+          : (providerDefaultMaxInflight(providerId) ?? DEFAULT_PROVIDER_MAX_INFLIGHT),
       maxInflightPerProxy: patch.maxInflightPerProxy ?? null,
       usageFloor: patch.usageFloor ?? null,
       usageFloorUnit: patch.usageFloorUnit ?? "percent",

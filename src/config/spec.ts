@@ -142,6 +142,12 @@ export const CONFIG_SPEC = {
   // Network policy (trusted proxy + SSRF)
   TRUSTED_PROXY_CIDRS: { kind: "list" },
   CARTETHYIA_ALLOW_PRIVATE_UPSTREAMS: { kind: "flag" },
+  /**
+   * `expose` (default) or `hide`. `hide` conceals which upstream served a
+   * request from the client: neutral error envelopes and the client's own
+   * model name on responses. See `concealPublicError` (`gateway-error.ts`).
+   */
+  CARTETHYIA_UPSTREAM_IDENTITY: { kind: "text", default: "expose" },
   CARTETHYIA_ALLOWED_NETWORKS: { kind: "list" },
   CARTETHYIA_MAX_REDIRECTS: { kind: "optional-int", min: 0, max: 10 },
 

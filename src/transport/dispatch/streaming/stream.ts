@@ -34,6 +34,7 @@
  * a change here that alters behavior fails there.
  */
 import { GatewayError } from "../../../protocol/gateway-error";
+import { resolveUpstreamIdentityMode } from "../../../config/security";
 import type { CanonicalEvent, CanonicalRequest } from "../../../protocol/canonical-model";
 import type { ProviderAdapter, ResolvedCredential } from "../../../providers/provider-contracts";
 import type { ValidatedNetworkBindingFactory } from "../../../network/pool/resolver";
@@ -282,21 +283,29 @@ export async function dispatchStreamingAttempt(input: StreamingDispatchInput): P
   // A Responses-family wire may deliver a prelude with no client-renderable
   // content; the retry guard below keys on this flag.
   const recoverableResponsesPrelude = candidate.wire_family === "responses";
+  // Under `CARTETHYIA_UPSTREAM_IDENTITY=hide` the client hears back the model
+  // name it asked for (an alias or combo), never the upstream's id.
+  const concealedModel =
+    resolveUpstreamIdentityMode() === "hide"
+      ? (prepared.plan?.requested_model ?? canonicalRequest.model)
+      : undefined;
+  const encoderModel = concealedModel ?? candidate.model_id;
   const pipeline = new StreamEventPipeline(
     canonicalRequest.source_surface,
     canonicalRequest.source_surface === "completion"
       ? {
-          model: candidate.model_id,
+          model: encoderModel,
           created: Date.now() / 1000,
           prompt: canonicalRequest.generation_controls["extension:completion.prompt"],
           echo: canonicalRequest.generation_controls["extension:completion.echo"] === true,
           suffix: canonicalRequest.generation_controls["extension:completion.suffix"],
         }
       : canonicalRequest.source_surface === "messages"
-        ? { response_id: `msg-${crypto.randomUUID()}`, model: candidate.model_id }
+        ? { response_id: `msg-${crypto.randomUUID()}`, model: encoderModel }
         : streamOptions,
     recoverableResponsesPrelude,
     { captureMode },
+    concealedModel,
   );
   const finalizer = new StreamFinalizer(
     {

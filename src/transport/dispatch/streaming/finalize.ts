@@ -11,7 +11,8 @@
  *
  * `test/gateway/streaming-contract.test.ts` pins the observable contract.
  */
-import { GatewayError, explainGatewayError, formatPublicErrorMessage, publicGatewayErrorDetails } from "../../../protocol/gateway-error";
+import { GatewayError, concealPublicError, explainGatewayError, formatPublicErrorMessage, publicGatewayErrorDetails } from "../../../protocol/gateway-error";
+import { resolveUpstreamIdentityMode } from "../../../config/security";
 import { classifyTerminalOutcome } from "../../failure-policy";
 import type { CanonicalEvent } from "../../../protocol/canonical-model";
 import type { CartethyiaDatabase } from "../../../persistence/db-handle";
@@ -602,7 +603,25 @@ export class StreamFinalizer {
       // Merge upstream details when available so a provider-reported error keeps its requestId/code.
       const details = gatewayError ? publicGatewayErrorDetails(gatewayError) : {};
       // For cb gpt-6.1-sol style invoke errors, upstream extError is already in gatewayError details via provider pipeline.
-      pipeline.emitErrorFrame({ origin, code, message, details }, controller);
+      const identityMode = resolveUpstreamIdentityMode();
+      const concealed = concealPublicError(
+        { origin, code, status: gatewayError?.status ?? 502, message, details },
+        identityMode,
+      );
+      pipeline.emitErrorFrame(
+        {
+          origin: concealed.origin,
+          code: concealed.code,
+          // The neutral sentence carries the placeholder; `expose` keeps the
+          // message exactly as it was.
+          message:
+            identityMode === "hide"
+              ? concealed.message.replaceAll("{requestId}", this.input.state.requestId)
+              : concealed.message,
+          details: concealed.details,
+        },
+        controller,
+      );
     }
     controller.close();
     void this.releaseStreamResources();

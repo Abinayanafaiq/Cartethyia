@@ -76,6 +76,49 @@ Rules (`gateway-error.ts`, `error-lifecycle.ts`):
   (`details.retryAfterMs`, `details.retryAt`); otherwise a literal 429 gets
   the safe floor `retry-after: 1`.
 
+### 2.1a Hiding the upstream (`CARTETHYIA_UPSTREAM_IDENTITY=hide`)
+
+For a deployment that resells capacity, `hide` stops a client from learning
+which upstream served it. The default `expose` is the envelope described above.
+One owner: `concealPublicError` (`src/protocol/gateway-error.ts`), applied by
+the error middleware, the mid-stream error frame (`streaming/finalize.ts`), and
+the stored Request Detail copy (`attempt-finalize.ts`). Under `hide`:
+
+- **`origin`** is always `cartethyia`. `upstream`/`network` would already say a
+  supplier sits behind the gateway.
+- **`code`** folds the internal vocabulary onto a neutral set: account, pool,
+  provider, and upstream availability codes become `overloaded`; capacity codes
+  (`provider_capacity_exhausted`, `accounts_rate_limited`, the pool capacity
+  codes, `tenant_capacity_exhausted`) become `rate_limited`;
+  `upstream_not_found`/`ambiguous_model` become `model_not_found`. An
+  `authentication_failed` or `quota_exceeded` that the **upstream** produced
+  becomes `overloaded` with status 503: it concerns the gateway's own
+  credential, so "check your API key" would be both false and a hint. An
+  unknown supplier code folds by status class (`overloaded` or
+  `invalid_request`). Otherwise the HTTP status is unchanged.
+- **`message`** is a fixed neutral sentence per code (`NEUTRAL_ERROR_MESSAGES`),
+  plus the request id. The upstream's own wording is a fingerprint, so it never
+  passes through. A gateway-only code without a sentence (share links,
+  client-router denial, Elysia built-ins) keeps its text.
+- **`details`** keep only `retryAfterMs` and `retryAt`.
+
+Successful responses get the same treatment (`concealResponseIdentity`,
+`src/transport/surface/public-identity.ts`). The opening event's `model` becomes
+the name the client asked for (alias, combo, or direct id), and
+`system_fingerprint` is dropped. On every surface except Responses, the
+upstream's id is replaced by one the gateway mints. Responses ids are kept
+because a client chains them back as `previous_response_id`. `/v1/models`
+reports `owned_by: "cartethyia"` for every row.
+
+Telemetry, the event transcript, and Request Detail keep the real error, code,
+and model, so operators debug from the console as before.
+
+`hide` does not rename models. A key that may see `openscale/...` rows in
+`/v1/models` still sees a supplier's name in the id. Give customer keys a
+`whitelist` of aliases or combos (`modelAccessMode` + `modelList`): then
+`/v1/models` lists only those names, and a direct provider id answers
+`model_not_allowed`.
+
 ### 2.2 Console envelope (`/console/api/*`)
 
 ```json

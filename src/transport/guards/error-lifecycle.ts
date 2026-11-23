@@ -1,6 +1,7 @@
 // Error normalization + telemetry/cleanup lifecycle for the transport pipeline.
 import { Elysia } from "elysia";
-import { GatewayError, explainGatewayError, formatPublicErrorMessage, publicGatewayErrorDetails } from "../../protocol/gateway-error";
+import { GatewayError, concealPublicError, explainGatewayError, formatPublicErrorMessage, publicGatewayErrorDetails } from "../../protocol/gateway-error";
+import { resolveUpstreamIdentityMode } from "../../config/security";
 import type { ProxyRequestState, ProxyRequestStateStore } from "../request/state";
 import { GATEWAY_SECURITY_HEADERS } from "../../security/outbound-headers";
 import type { TelemetryBatchBuffer, TelemetryEventInput } from "../../observability/telemetry-buffer";
@@ -105,8 +106,20 @@ export function createErrorNormalizationMiddleware(deps: {
                   ? builtin?.message ?? "Unable to process the request as written."
                   : "The gateway hit an internal error. Retry; if it persists, quote the request id to support. Even we have bad days — retry, and quote the id if it persists 🐻",
               );
-      const message = applyRequestId(rawMessage, requestId);
       const origin = gateway?.origin ?? "cartethyia";
+      // Telemetry (`state.outcome` below) records the real code and origin;
+      // only what the client is sent is concealed.
+      const concealed = concealPublicError(
+        {
+          origin,
+          code,
+          status,
+          message: rawMessage,
+          details: gateway ? publicGatewayErrorDetails(gateway) : {},
+        },
+        resolveUpstreamIdentityMode(),
+      );
+      const message = applyRequestId(concealed.message, requestId);
       // `afterResponse` telemetry hook can enqueue it even when the request
       // never reached canonical parse / auth / preparation.
       if (state && !state.outcome) {
@@ -125,7 +138,7 @@ export function createErrorNormalizationMiddleware(deps: {
       set.headers["x-request-id"] = requestId;
       Object.assign(set.headers, GATEWAY_SECURITY_HEADERS);
       if (deps.hsts) set.headers["strict-transport-security"] = "max-age=31536000";
-      set.status = status;
+      set.status = concealed.status;
       // Emit `retry-after` whenever the failure carries a real wait hint, not
       // only on a literal 429. `classifyUpstreamFailure` marks several
       // non-429 responses retryable (503 `admission_unavailable`, 529
@@ -136,17 +149,15 @@ export function createErrorNormalizationMiddleware(deps: {
       if (set.headers["retry-after"] === undefined) {
         const hint = retryAfterSeconds(gateway);
         if (hint !== undefined) set.headers["retry-after"] = hint;
-        else if (status === 429) set.headers["retry-after"] = "1";
+        else if (concealed.status === 429) set.headers["retry-after"] = "1";
       }
       const envelope = {
         error: {
-          origin,
-          code,
+          origin: concealed.origin,
+          code: concealed.code,
           requestId,
           message,
-          ...(gateway
-            ? { details: publicGatewayErrorDetails(gateway) }
-            : {}),
+          ...(gateway ? { details: concealed.details } : {}),
         },
       };
       // Kept on the state so an early rejection — which never reaches

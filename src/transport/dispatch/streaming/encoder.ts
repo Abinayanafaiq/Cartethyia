@@ -14,6 +14,7 @@ import { canonicalTerminal } from "../../../protocol/codecs";
 import { reasoningTextOf } from "../../../protocol/reasoning-text";
 import { ThinkSplitter } from "../../../protocol/think-split";
 import { createDispatchStreamEncoder, type DispatchStreamEncoder } from "../stream-bridge";
+import { concealResponseIdentity } from "../../surface/public-identity";
 import { THINKING_LOOP_MARKER, ThinkingLoopDetector } from "./thinking-loop";
 
 /** The terminal event shape every stream settles (or fails to settle) on. */
@@ -93,6 +94,7 @@ export class StreamEventPipeline {
    */
   private readonly diagnosticsCaptureMode: "none" | "metadata" | "full";
   private readonly streamEncoder: DispatchStreamEncoder;
+  private readonly surface: SourceSurface;
   // One splitter per stream, kept purely as a feeder for the loop guard: it
   // reports the content currently inside an open `<think>` span so a runaway
   // chain-of-thought is caught even when the provider wrote it into the text
@@ -113,7 +115,13 @@ export class StreamEventPipeline {
     encoderOptions: Record<string, unknown>,
     recoverableResponsesPrelude: boolean,
     diagnostics: { captureMode: "none" | "metadata" | "full" } = { captureMode: "full" },
+    /**
+     * Set under `CARTETHYIA_UPSTREAM_IDENTITY=hide`: the model name the client
+     * asked for, which replaces the upstream's own on the encoded stream.
+     */
+    private readonly concealedModel?: string,
   ) {
+    this.surface = surface;
     this.streamEncoder = createDispatchStreamEncoder(surface, encoderOptions);
     this.recoverableResponsesPrelude = recoverableResponsesPrelude;
     this.diagnosticsCaptureMode = diagnostics.captureMode;
@@ -236,7 +244,11 @@ export class StreamEventPipeline {
     event: CanonicalEvent & { timestamp: number },
     controller: ReadableStreamDefaultController<Uint8Array>,
   ): boolean {
-    const toEnqueue = this.streamEncoder.push(event);
+    const toEnqueue = this.streamEncoder.push(
+      this.concealedModel === undefined
+        ? event
+        : (concealResponseIdentity(event, this.concealedModel, this.surface) as CanonicalEvent & { timestamp: number }),
+    );
     if (toEnqueue.length > 0 && this.firstByteAt === undefined) this.firstByteAt = Date.now();
     for (const bytes of toEnqueue) {
       controller.enqueue(bytes);
