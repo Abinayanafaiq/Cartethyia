@@ -1,8 +1,9 @@
 // Provider assembly: builtin registry construction, BYOK wiring, and DB catalog materialization.
 import type { WireFamily } from "../../protocol/canonical-model";
 
-import { and, eq, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, notInArray, sql } from "drizzle-orm";
 import { mergeJson } from "../../persistence/dialect";
+import { log } from "../../observability/logger";
 import { GatewayError } from "../../protocol/gateway-error";
 import { isBundledProviderId, parseProviderId, type ProviderId } from "../provider-contracts";
 import type { ModelDefinition } from "../provider-model-definition";
@@ -83,6 +84,7 @@ export function markCatalogSeeded(): void {
  * {@link retireUnbundledProviders}, run once on the boot path.
  */
 export async function seedBundledProviders(db: CartethyiaDatabase): Promise<void> {
+  await adoptCustomRowsOfBundledIds(db);
   const rows = BUNDLED_PROVIDER_MODULES.map((provider) => ({
     id: provider.id,
     wireFamilyDefault: provider.wireFamilyDefault,
@@ -115,6 +117,52 @@ export async function seedBundledProviders(db: CartethyiaDatabase): Promise<void
   // The compiled catalog is derived from the registry, and this is the path
   // that reconciles the bundle's own rows into it.
   bumpCatalogRevision();
+}
+
+/**
+ * Turns a custom (BYOK) provider row into the bundled provider that now owns
+ * its id, and returns the ids it adopted.
+ *
+ * An operator can add a provider as a custom row before the gateway ships it
+ * (OpenScale was), so a later release finds a `providers` row with the bundled
+ * id and a `base_url`. The seed upsert below keys on id and keeps `base_url`,
+ * so the row stayed custom, and {@link registerByokProviders} then refused the
+ * whole boot with "BYOK provider ID collides with a built-in".
+ *
+ * Adopting the row is the honest reading: the operator configured this exact
+ * provider id, and the bundled adapter now serves it. Only the custom-provider
+ * wiring is cleared (`base_url`, `compatibility_profile`, the tenant owner) so
+ * the row reads exactly like a freshly seeded bundled one. Everything keyed on
+ * the id survives untouched: accounts, their credentials and health, routing
+ * settings, model rows the operator added, aliases and combos. The bundled
+ * metadata supplies the base URL from then on, which is why the custom host is
+ * logged — an operator who pointed the id somewhere else can see it.
+ */
+export async function adoptCustomRowsOfBundledIds(db: CartethyiaDatabase): Promise<readonly string[]> {
+  const bundledIds = BUNDLED_PROVIDER_MODULES.map((provider) => provider.id);
+  const colliding = await db
+    .select({ id: providers.id, baseUrl: providers.baseUrl })
+    .from(providers)
+    .where(and(isNotNull(providers.baseUrl), inArray(providers.id, bundledIds)));
+  if (colliding.length === 0) return [];
+  const ids = colliding.map((row) => row.id);
+  await db
+    .update(providers)
+    .set({ baseUrl: null, compatibilityProfile: null, tenantId: null })
+    .where(inArray(providers.id, ids));
+  for (const row of colliding) {
+    let host = "unparseable";
+    try {
+      host = new URL(row.baseUrl ?? "").host;
+    } catch {
+      // The host is only reported; an unparseable value changes nothing.
+    }
+    log.warn("[providers] adopted a custom provider row as the bundled provider with the same id", {
+      providerId: row.id,
+      previousCustomHost: host,
+    });
+  }
+  return ids;
 }
 
 /**
