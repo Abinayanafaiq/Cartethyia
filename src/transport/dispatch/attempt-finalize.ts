@@ -2,6 +2,7 @@
 import { readReportedModel } from "../../providers/operations/reported-model";
 import { GatewayError, publicGatewayErrorBody } from "../../protocol/gateway-error";
 import { resolveUpstreamIdentityMode } from "../../config/security";
+import { drainAbortReason } from "../shutdown-notice";
 import type { ValidatedOutboundFetch } from "../../providers/provider-contracts";
 import { reportAttemptOutcome } from "../../providers/operations/account-health-service";
 import type { UsageRecord } from "../../protocol/canonical-model";
@@ -785,7 +786,12 @@ export async function completeAttempt(
   // matches the historical `!cancelled` guards at every site. Health is
   // advisory: a failed report must never re-enter the retry path (a retry
   // would see `completed` and skip completion entirely), so it is swallowed.
-  if (completion.status !== "cancelled" && !disableProxy) {
+  // A drain is this process stopping, not the upstream failing: an in-flight
+  // request cut by `systemctl stop` / an update must not leave the account (or
+  // its model) cooling for minutes after the gateway is back. Seen live: a
+  // restart stamped a 2-minute `model_capacity` cooldown on a healthy fallback.
+  const drained = drainAbortReason(completion.error) !== undefined;
+  if (completion.status !== "cancelled" && !disableProxy && !drained) {
     // DEPLOYMENT_DISABLED and similar infra errors are proxy pool failures,
     // not account quota. Classify with scope pool so account stays healthy.
     const msg = completion.error instanceof Error ? completion.error.message.toLowerCase() : "";

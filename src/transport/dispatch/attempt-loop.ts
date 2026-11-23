@@ -29,6 +29,7 @@ import { acquireAttemptLeases, releaseAttemptLeases } from "./leases";
 import type { AttemptLeaseSource, AttemptLeases } from "./leases";
 import type { AttemptLeaseOwnership } from "./leases";
 import { metrics } from "../../observability/metrics";
+import { log } from "../../observability/logger";
 import type { NetworkPoolSelector } from "../../network/pool/selector";
 import type { ProxyRequestState } from "../request/state";
 import type { TelemetryBatchBuffer } from "../../observability/telemetry-buffer";
@@ -479,6 +480,23 @@ export async function runAttemptLoop<TResult, TAdapter>(
         metrics.proxy_requests_total.inc(1, { status: cancelled ? "cancelled" : "failed" });
         throw error;
       }
+      // An intermediate failure leaves no other trace: only the terminal
+      // attempt gets a telemetry row, and a failure that does not change the
+      // account's health writes no health event. Without this line a combo
+      // whose fallback member failed and whose primary was full reads, in
+      // Request Detail, as "every account at max-inflight" — the fallback's own
+      // error is gone. Names and codes only: no credential, no request body.
+      log.warn("[dispatch] attempt failed; trying the next candidate", {
+        requestId: state.requestId,
+        attempt: attempts + 1,
+        providerId: candidate.provider_id,
+        account: candidate.provider_account_label ?? candidate.provider_account_id ?? null,
+        model: candidate.model_id,
+        code: error instanceof GatewayError ? error.code : "unknown",
+        status: error instanceof GatewayError ? error.status : null,
+        origin: error instanceof GatewayError ? error.origin : null,
+        message: (error instanceof Error ? error.message : String(error)).slice(0, 300),
+      });
       // A failed combo member stays flagged for this request. Move it behind
       // every candidate that has not failed yet, so the next attempt cannot
       // stick to it while a sibling remains. It becomes eligible again only
