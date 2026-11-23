@@ -203,6 +203,36 @@ interface AttemptLoopInput<TResult, TAdapter> {
 }
 
 /**
+ * Logs what `plan()` decided for every candidate of a request that then failed.
+ *
+ * `plan()` records each candidate's verdict (eligible, saturated, cooling,
+ * plan gate, missing capability, quota floor, …) in `decisions`, but nothing
+ * reads it on the failure path. A combo whose fallback member was not in the
+ * list for one request then fails with the primary's "every account at
+ * max-inflight" and gives no hint why the fallback was never dialed — the
+ * attempt log only covers candidates that were. Logging every decision, not
+ * only the ineligible ones, also shows a member that was never matched at all:
+ * it is simply absent. Keys are `provider:model[:account]`, never credentials.
+ */
+function logPlanDecisions(requestId: string, plan: AttemptLeaseSource["plan"]): void {
+  const candidates = [...plan.decisions.entries()].map(([candidate, decision]) => ({
+    candidate,
+    eligible: decision.eligible,
+    reason: decision.reason,
+    ...(decision.saturated === true ? { saturated: true } : {}),
+    ...(decision.cooldown_until === undefined
+      ? {}
+      : { cooldownUntil: new Date(decision.cooldown_until).toISOString() }),
+  }));
+  log.warn("[dispatch] request failed; plan decisions", {
+    requestId,
+    requested: plan.requested_model,
+    resolved: plan.resolved_model,
+    candidates,
+  });
+}
+
+/**
  * Shared per-candidate attempt lifecycle for the canonical proxy routes and
  * the native Responses-compact route: admission lease → pool slot → routing
  * reservation, the route-specific upstream operation, then one
@@ -477,6 +507,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
         }
       }
       if (terminalAttempt) {
+        if (!cancelled) logPlanDecisions(state.requestId, leaseSource.plan);
         metrics.proxy_requests_total.inc(1, { status: cancelled ? "cancelled" : "failed" });
         throw error;
       }
@@ -572,6 +603,7 @@ export async function runAttemptLoop<TResult, TAdapter>(
       includeClientResponse: true,
     }));
   }
+  logPlanDecisions(state.requestId, leaseSource.plan);
   metrics.proxy_requests_total.inc(1, { status: "failed" });
   throw lastError;
 }
